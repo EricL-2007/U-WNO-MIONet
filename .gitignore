@@ -1,0 +1,6 @@
+*.npy
+*.npz
+predictions/
+output/
+pre_train/
+model/
