@@ -23,19 +23,34 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 
+# Required: WaveConv1d/WaveConv2d/WaveConv2dCwt (the classes this project's
+# WaveletDecoder actually uses) all depend on pytorch_wavelets. This used to be
+# bundled into one try/except together with ptwt/pywt below — so an environment
+# missing ptwt/pywt (a package this project never uses) silently broke these
+# required imports too, deferring the failure to a confusing NameError deep inside
+# WaveConv2d.__init__ instead of failing immediately and clearly here.
 try:
-    import ptwt, pywt
-    from ptwt.conv_transform_3 import wavedec3, waverec3
     from pytorch_wavelets import DWT1D, IDWT1D
     from pytorch_wavelets import DTCWTForward, DTCWTInverse
     from pytorch_wavelets import DWT, IDWT
+except ImportError as e:
+    raise ImportError(
+        "wavelet_convolution.py requires 'pytorch_wavelets'. Install with:\n"
+        "  git clone https://github.com/fbcotter/pytorch_wavelets\n"
+        "  cd pytorch_wavelets && pip install ."
+    ) from e
+
+# Optional: only WaveConv3d (not used anywhere in this project) needs these.
+try:
+    import ptwt, pywt
+    from ptwt.conv_transform_3 import wavedec3, waverec3
 except ImportError:
-    print('Wavelet convolution requires <Pytorch Wavelets>, <PyWavelets>, <Pytorch Wavelet Toolbox> \n \
-                    For Pytorch Wavelet Toolbox: $ pip install ptwt \n \
-                    For PyWavelets: $ conda install pywavelets \n \
-                    For Pytorch Wavelets: $ git clone https://github.com/fbcotter/pytorch_wavelets \n \
-                                          $ cd pytorch_wavelets \n \
-                                          $ pip install .')
+    ptwt = pywt = wavedec3 = waverec3 = None
+    print(
+        "Note: 'ptwt'/'pywt' not found — only affects WaveConv3d (unused by this "
+        "project's WaveletDecoder). Install with 'pip install ptwt' and "
+        "'conda install pywavelets' if you need 3D wavelet convolution."
+    )
 
 """ Def: 1d Wavelet convolutional layer """
 class WaveConv1d(nn.Module):
