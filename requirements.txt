@@ -1,0 +1,12 @@
+deepxde
+matplotlib
+numpy
+pandas
+sklearn
+torch
+
+
+
+
+
+

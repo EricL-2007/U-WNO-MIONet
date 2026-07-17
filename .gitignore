@@ -4,3 +4,10 @@ predictions/
 output/
 pre_train/
 model/
+plots/
+
+__pycache__/
+*.pyc
+.DS_Store
+._*
+*.log
