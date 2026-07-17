@@ -9,8 +9,8 @@ Download data from [OneDrive](https://yaleedu-my.sharepoint.com/:f:/g/personal/l
 Note: When you run the codes, please use the modified deepxde under the directory of corresponding python file. The codes cannot run under the public version of deepxde.
 
 #### Fourier-MIONet
-- Run [Fourier-MIONet_sg.py](Fourier-MIONet_sg.py) for gas saturation.
-- Run [Fourier-MIONet_dP.py](Fourier-MIONet_dP.py) for pressure buildup.
+- Run [Fourier-UWNO-MIONet_sg.py](Fourier-UWNO-MIONet_sg.py) for gas saturation.
+- Run [Fourier-UWNO-MIONet_dP.py](Fourier-UWNO-MIONet_dP.py) for pressure buildup.
 
 #### vanilla MIONet
 - Run [MIONet_vanilla_SG.py](baselines/MIONet_vanilla_SG.py) for gas saturation.

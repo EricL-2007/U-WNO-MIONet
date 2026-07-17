@@ -1,5 +1,5 @@
 """Plotting utilities for the per-checkpoint train/test loss, R^2, and MAE curves
-written to comparison_log.csv by Fourier-MIONet_sg.py.
+written to comparison_log.csv by Fourier-UWNO-MIONet_sg.py.
 
 generate_predictions_and_plots.py calls these directly against a real
 comparison_log.csv; the __main__ block below only exercises them against synthetic

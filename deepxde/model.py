@@ -282,7 +282,7 @@ class Model:
             losses = torch.stack(losses)
             # Weighted losses
             if loss_weights is not None:
-                losses *= torch.as_tensor(loss_weights)
+                losses *= torch.as_tensor(loss_weights, device=losses.device, dtype=losses.dtype)
             # Clear cached Jacobians and Hessians.
             grad.clear()
             return outputs_, losses

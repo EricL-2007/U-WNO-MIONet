@@ -1,9 +1,9 @@
 # wavelet_decoder.py
-# Replaces the decoder() class in Fourier-MIONet_sg.py
+# Replaces the decoder() class in Fourier-UWNO-MIONet_sg.py
 # Sources:
 #   - Logic/structure: UWNO2d.forward() in U-WNO/uwno2d_Darcy.py
 #   - WaveConv2d:      U-WNO/wavelet_convolution.py
-#   - U_net class:     reused from Fourier-MIONet_sg.py (imported below)
+#   - U_net class:     reused from Fourier-UWNO-MIONet_sg.py (imported below)
 
 import torch
 import torch.nn as nn
@@ -46,7 +46,7 @@ class WaveletDecoder(nn.Module):
             for _ in range(layers)
         ])
 
-        # U_net blocks: imported from Fourier-MIONet_sg.py, no changes
+        # U_net blocks: imported from Fourier-UWNO-MIONet_sg.py, no changes
         # Loaded dynamically to avoid circular import
         self.unet = None  # set after import in get_model() below
 
@@ -55,7 +55,7 @@ class WaveletDecoder(nn.Module):
         self.fc2 = nn.Linear(width2, 1)
 
     def set_unet(self, unet_list):
-        """Call this after importing U_net from Fourier-MIONet_sg.py"""
+        """Call this after importing U_net from Fourier-UWNO-MIONet_sg.py"""
         self.unet = unet_list
 
     def forward(self, x):

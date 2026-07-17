@@ -69,17 +69,22 @@ class Quadruple(Data):
 
 class QuadrupleCartesianProd(Data):
     def __init__(self, X_train, y_train, X_test, y_test):
+        # Each (branch, trunk) pair may itself carry a spatial block (e.g. a 96x200
+        # field per timestep) rather than a single scalar, so validate divisibility
+        # instead of requiring len(branch) * len(trunk) == y.size exactly.
+        n_branch_train, n_trunk_train = len(X_train[0]), len(X_train[2])
         if (
-            len(X_train[0]) * len(X_train[2]) != y_train.size
-            or len(X_train[1]) * len(X_train[2]) != y_train.size
-            or len(X_train[0]) != len(X_train[1])
+            n_branch_train * n_trunk_train == 0
+            or y_train.size % (n_branch_train * n_trunk_train) != 0
+            or len(X_train[1]) != n_branch_train
         ):
             raise ValueError("The training dataset does not have the format of Cartesian product.")
 
+        n_branch_test, n_trunk_test = len(X_test[0]), len(X_test[2])
         if (
-            len(X_test[0]) * len(X_test[2]) != y_test.size
-            or len(X_test[1]) * len(X_test[2]) != y_test.size
-            or len(X_test[0]) != len(X_test[1])
+            n_branch_test * n_trunk_test == 0
+            or y_test.size % (n_branch_test * n_trunk_test) != 0
+            or len(X_test[1]) != n_branch_test
         ):
             raise ValueError("The testing dataset does not have the format of Cartesian product.")
 

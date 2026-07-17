@@ -23,12 +23,13 @@ CKPT_DIR = os.path.join(PROJECT_ROOT, "pre_train")
 PRED_DIR = os.path.join(PROJECT_ROOT, "predictions")
 PLOTS_FIELD_DIR = os.path.join(PROJECT_ROOT, "plots", "field_plots")
 PLOTS_COMPARISON_DIR = os.path.join(PROJECT_ROOT, "plots", "comparison")
-COMPARISON_CSV = os.path.join(PROJECT_ROOT, "comparison_log.csv")
+COMPARISON_CSV_SG = os.path.join(PROJECT_ROOT, "comparison_log.csv")
+COMPARISON_CSV_DP = os.path.join(PROJECT_ROOT, "comparison_log_dp.csv")
 META_PATH = os.path.join(PRED_DIR, "meta.json")
 
 STEP_RE = re.compile(r"-(\d+)\.pt$")
 
-# (task, arch) -> checkpoint glob pattern, matching what Fourier-MIONet_sg.py's
+# (task, arch) -> checkpoint glob pattern, matching what Fourier-UWNO-MIONet_sg.py's
 # MODEL_SPECS[*]["ckpt"] writes (sg_fourier_model.ckpt-<step>.pt / sg_wno_model.ckpt-
 # <step>.pt), and the equivalent dP_* naming if a parallel pressure script/checkpoints
 # ever exists.
@@ -251,7 +252,7 @@ def main():
 
     sg_found = {arch: v for (task, arch), v in found.items() if task == "sg"}
     if sg_found:
-        sg_module = _load_module(os.path.join(PROJECT_ROOT, "Fourier-MIONet_sg.py"), "fourier_mionet_sg")
+        sg_module = _load_module(os.path.join(PROJECT_ROOT, "Fourier-UWNO-MIONet_sg.py"), "fourier_mionet_sg")
         written_files += process_task(
             "sg", sg_module, sg_found, field_name="Gas Saturation", apply_mask=True, meta=meta
         )
@@ -260,7 +261,7 @@ def main():
 
     dP_found = {arch: v for (task, arch), v in found.items() if task == "dP"}
     if dP_found:
-        dP_path = os.path.join(PROJECT_ROOT, "Fourier-MIONet_dP.py")
+        dP_path = os.path.join(PROJECT_ROOT, "Fourier-UWNO-MIONet_dP.py")
         dP_module = _load_module(dP_path, "fourier_mionet_dp") if os.path.exists(dP_path) else None
         required_attrs = [
             "load_and_normalize_data", "build_net", "_build_fourier_decoder",
@@ -275,8 +276,8 @@ def main():
         else:
             print(
                 "\ndP_fourier_model.ckpt-*.pt / dP_wno_model.ckpt-*.pt checkpoints exist, but "
-                "Fourier-MIONet_dP.py hasn't been refactored to the same dual-model interface as "
-                "Fourier-MIONet_sg.py (load_and_normalize_data/build_net/_build_*_decoder/"
+                "Fourier-UWNO-MIONet_dP.py hasn't been refactored to the same dual-model interface as "
+                "Fourier-UWNO-MIONet_sg.py (load_and_normalize_data/build_net/_build_*_decoder/"
                 "predict_in_chunks/etc.) — skipping pressure predictions/plots. Ask for that "
                 "refactor if you want this supported."
             )
@@ -285,15 +286,17 @@ def main():
 
     save_meta(meta)
 
-    if os.path.exists(COMPARISON_CSV):
-        print(f"\n{'=' * 70}\nPlotting training curves from {COMPARISON_CSV}\n{'=' * 70}")
-        written_files += plot_comparison.plot_all_comparisons(COMPARISON_CSV, PLOTS_COMPARISON_DIR)
-    else:
-        print(
-            f"\n{COMPARISON_CSV} not found (it's only written once a full dual-model training run "
-            "completes) — skipping the loss/R2/MAE-vs-step comparison curves. Everything checkpoint-"
-            "based above still ran."
-        )
+    for task_label, csv_path in (("sg", COMPARISON_CSV_SG), ("dP", COMPARISON_CSV_DP)):
+        if os.path.exists(csv_path):
+            out_dir = os.path.join(PLOTS_COMPARISON_DIR, task_label)
+            print(f"\n{'=' * 70}\nPlotting {task_label} training curves from {csv_path}\n{'=' * 70}")
+            written_files += plot_comparison.plot_all_comparisons(csv_path, out_dir)
+        else:
+            print(
+                f"\n{csv_path} not found (it's only written once a full {task_label} dual-model "
+                "training run completes) — skipping its loss/R2/MAE-vs-step comparison curves. "
+                "Everything checkpoint-based above still ran."
+            )
 
     print(f"\n{'=' * 70}\nDone. Files written:\n{'=' * 70}")
     for f in written_files:

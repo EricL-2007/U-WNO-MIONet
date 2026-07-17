@@ -20,7 +20,7 @@ def build_plume_mask(y_true):
     """Boolean mask, shape (N, 24, 96, 200), True where a cell is inside the CO2 plume.
 
     Mirrors the masking convention used for the R2_plume/MAE_plume training metrics in
-    Fourier-MIONet_sg.py: a depth row is excluded only if its near-well column (r=0) is
+    Fourier-UWNO-MIONet_sg.py: a depth row is excluded only if its near-well column (r=0) is
     still ~0 at the final timestep, and that exclusion is broadcast across all timesteps
     and radial positions for that (sample, z) pair. Keeping the same convention here
     means the plots' R2/MAE line up with the numbers already logged during training.

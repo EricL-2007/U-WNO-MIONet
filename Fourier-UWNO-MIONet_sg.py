@@ -36,7 +36,11 @@ reset_seed(SEED)
 # ============================================================
 # Device
 # ============================================================
-if torch.backends.mps.is_available():
+if os.environ.get("FORCE_CPU") == "1":
+    # Escape hatch for MPS backward-pass bugs on specific op combinations (e.g. the
+    # WaveletDecoder's layer-0 U-Net branch) — not needed on CUDA, so leave unset there.
+    device = torch.device("cpu")
+elif torch.backends.mps.is_available():
     device = torch.device("mps")
 elif torch.cuda.is_available():
     device = torch.device("cuda")
@@ -305,24 +309,25 @@ class WaveletDecoder(nn.Module):
         r = x
 
         for j, (convl, wl) in enumerate(zip(self.conv, self.w)):
-            if j == 0:
-                x = convl(x) + wl(x)
-            else:
-                x = convl(x + r) + wl(x) + self.unet[j](x)
+            # Aligned to the reference UWNO2d (U-WNO/uwno2d_Darcy.py): a real U-Net
+            # block and the "+r" residual are applied uniformly at every layer,
+            # including layer 0 (this used to special-case layer 0 with no unet and
+            # no residual).
+            x = convl(x + r) + wl(x) + self.unet[j](x)
 
             if j != self.layers - 1:
                 x = F.mish(10 * self.a * x)
 
         x = x.permute(0, 2, 3, 1)
-        x = F.relu(self.fc1(x))
+        x = F.gelu(self.fc1(x))
         x = self.fc2(x)
-        x = x.view(batchsize, size_x, size_y, 1)[..., :-8, :-8, :]
+        x = x.reshape(batchsize, size_x, size_y, 1)[..., :-8, :-8, :]
         return x.squeeze(-1)
 
 
 class FourierDecoder(nn.Module):
     """Vanilla Fourier-MIONet decoder baseline (SpectralConv2d + U_net, no wavelets).
-    Ported from the active forward path of `decoder` in Fourier-MIONet_dP.py (that class
+    Ported from the active forward path of `decoder` in Fourier-UWNO-MIONet_dP.py (that class
     also allocated conv1/conv2/conv4/conv5/unet4/unet5, but its forward() never used
     them, so they are dropped here to keep the parameter-count comparison honest)."""
 
@@ -356,7 +361,7 @@ class FourierDecoder(nn.Module):
         x = x.permute(0, 2, 3, 1)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
-        x = x.view(batchsize, size_x, size_y, 1)[..., :-8, :-8, :]
+        x = x.reshape(batchsize, size_x, size_y, 1)[..., :-8, :-8, :]
         return x.squeeze(-1)
 
 
@@ -398,7 +403,7 @@ def _build_wavelet_decoder():
     dec.set_unet(
         nn.ModuleList(
             [
-                nn.Identity(),
+                U_net(36, 36, 3, 0.0),
                 U_net(36, 36, 3, 0.0),
                 U_net(36, 36, 3, 0.0),
                 U_net(36, 36, 3, 0.0),
