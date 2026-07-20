@@ -1,9 +1,11 @@
 """Generate predictions from EXISTING checkpoints and produce the full set of plots.
 
 Does NOT train anything and does NOT require the full 1200-iteration run to have
-finished — it works against whatever sg_fourier_model.ckpt-*.pt / sg_wno_model.ckpt-*.pt
-(and dP_* equivalents, if present) are already on disk in pre_train/, picking the
-highest-step checkpoint available for each model.
+finished — it works against whatever checkpoints are already on disk in pre_train/.
+Prefers each model's guaranteed-best checkpoint (<prefix>-BEST.pt, written by
+BestModelSaver during training); falls back to the highest-numbered periodic
+snapshot with an explicit warning if no BEST file exists (e.g. runs from before
+BestModelSaver existed).
 
 Run with:  python generate_predictions_and_plots.py
 """
@@ -14,6 +16,7 @@ import os
 import re
 
 import numpy as np
+import torch
 
 import plot_comparison
 import plot_fields
@@ -62,6 +65,25 @@ def _load_module(path, name):
 
 
 def find_best_checkpoint(pattern):
+    """Prefer the guaranteed-best checkpoint written by BestModelSaver
+    (<prefix>-BEST.pt) over the highest-numbered periodic snapshot. The periodic
+    snapshot is NOT guaranteed to be the true best step — ModelCheckpoint's own
+    save_better_only+period sampling (and, for dP, a different monitored quantity
+    than best_step uses) can miss it entirely. See BestModelSaver in
+    Fourier-UWNO-MIONet_{sg,dP}.py for the full story.
+
+    Returns (path, step, is_confirmed_best).
+    """
+    best_glob_pattern = pattern.replace("*.pt", "BEST.pt")
+    best_paths = glob.glob(os.path.join(CKPT_DIR, best_glob_pattern))
+    if best_paths:
+        best_path = best_paths[0]
+        checkpoint = torch.load(best_path, map_location="cpu")
+        step = checkpoint.get("best_step", -1)
+        return best_path, step, True
+
+    # Fallback for runs from before BestModelSaver existed: highest-numbered
+    # periodic snapshot. This is a heuristic, not a guarantee — flagged upstream.
     paths = glob.glob(os.path.join(CKPT_DIR, pattern))
     best_path, best_step = None, -1
     for p in paths:
@@ -71,15 +93,15 @@ def find_best_checkpoint(pattern):
         step = int(m.group(1))
         if step > best_step:
             best_step, best_path = step, p
-    return best_path, best_step
+    return best_path, best_step, False
 
 
 def find_all_checkpoints():
     found = {}
     for (task, arch), pattern in CKPT_PATTERNS.items():
-        path, step = find_best_checkpoint(pattern)
+        path, step, is_confirmed_best = find_best_checkpoint(pattern)
         if path is not None:
-            found[(task, arch)] = (path, step)
+            found[(task, arch)] = (path, step, is_confirmed_best)
     return found
 
 
@@ -172,7 +194,14 @@ def process_task(task, module, found_for_task, field_name, apply_mask, meta):
     written_files.append(perm_path)
 
     y_preds = {}
-    for arch, (ckpt_path, step) in found_for_task.items():
+    for arch, (ckpt_path, step, is_confirmed_best) in found_for_task.items():
+        if not is_confirmed_best:
+            print(
+                f"  WARNING: [{task}/{arch}] no BEST checkpoint file found — using the "
+                f"highest-numbered periodic snapshot (step {step}) instead, which is NOT "
+                f"guaranteed to be the actual best-performing checkpoint. Re-run training "
+                f"with the current scripts (which write a guaranteed-best file) to fix this."
+            )
         y_pred = get_predictions(task, arch, module, ckpt_path, step, data_bundle, meta, written_files)
         y_preds[ARCH_LABEL[arch]] = y_pred
 
@@ -237,8 +266,9 @@ def process_task(task, module, found_for_task, field_name, apply_mask, meta):
 def main():
     print(f"{'=' * 70}\nScanning {CKPT_DIR} for checkpoints (no training will be run)\n{'=' * 70}")
     found = find_all_checkpoints()
-    for (task, arch), (path, step) in found.items():
-        print(f"  {task}/{arch}: using highest available step {step} -> {os.path.relpath(path, PROJECT_ROOT)}")
+    for (task, arch), (path, step, is_confirmed_best) in found.items():
+        label = "confirmed BEST" if is_confirmed_best else "highest-numbered snapshot, NOT confirmed best"
+        print(f"  {task}/{arch}: using step {step} [{label}] -> {os.path.relpath(path, PROJECT_ROOT)}")
 
     if not found:
         print("No checkpoints found matching sg_fourier/sg_wno/dP_fourier/dP_wno patterns in pre_train/. Nothing to do.")

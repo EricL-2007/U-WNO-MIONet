@@ -1,0 +1,6 @@
+{
+  "sg_fourier_step": 350,
+  "sg_wno_step": 300,
+  "dP_fourier_step": 150,
+  "dP_wno_step": 150
+}

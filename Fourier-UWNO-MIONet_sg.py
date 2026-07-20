@@ -417,6 +417,37 @@ def _build_fourier_decoder():
     return FourierDecoder(modes1=10, modes2=10, width=36, width2=128)
 
 
+class BestModelSaver(dde.callbacks.Callback):
+    """Saves net/optimizer state exactly when train_state.best_step advances to the
+    current step. ModelCheckpoint's own save_better_only+period only checks for an
+    improvement every `period` steps — and its `monitor` can be a different quantity
+    than best_step's (best_step is always picked by train loss, hardcoded in
+    TrainState.update_best(); ModelCheckpoint may be watching test loss instead) — so
+    the periodic checkpoint file can silently miss, or never match, the exact step
+    DeepXDE itself reports as best. This file is written in the same format
+    Model.save()/restore() use, so model.restore(this_path) works unchanged, and it
+    always corresponds exactly to train_state.best_step at the time of writing.
+    """
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+        self._last_saved_step = None
+
+    def on_epoch_end(self):
+        ts = self.model.train_state
+        if ts.best_step == ts.step and ts.best_step != self._last_saved_step:
+            torch.save(
+                {
+                    "model_state_dict": self.model.net.state_dict(),
+                    "optimizer_state_dict": self.model.opt.state_dict(),
+                    "best_step": ts.best_step,
+                },
+                self.filepath,
+            )
+            self._last_saved_step = ts.best_step
+
+
 # ============================================================
 # Load + normalize data (fall back to a smaller size if RAM/VRAM can't hold it)
 # ============================================================
@@ -602,6 +633,7 @@ if __name__ == "__main__":
 
         checker = dde.callbacks.ModelCheckpoint(spec["ckpt"], save_better_only=True, period=50)
         early_stopping = dde.callbacks.EarlyStopping(min_delta=1e-4, patience=100)
+        best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
 
         print(f"Training {spec['name']}...")
         start_time = time.time()
@@ -611,7 +643,7 @@ if __name__ == "__main__":
             timestep_batch_size=TIMESTEP_BATCH_SIZE,
             training_time_size=TRAINING_TIME_SIZE,
             display_every=DISPLAY_EVERY,
-            callbacks=[checker, early_stopping],
+            callbacks=[checker, early_stopping, best_saver],
         )
         elapsed = time.time() - start_time
         steps_run = max(train_state.step, 1)
@@ -621,11 +653,24 @@ if __name__ == "__main__":
         print(f"{spec['name']} best test loss:", train_state.best_loss_test)
         print(f"{spec['name']} best test metric:", train_state.best_metrics)
 
-        try:
-            model.restore(f"{spec['ckpt']}-{train_state.best_step}.pt", verbose=1)
-        except Exception as e:
-            print(f"Could not restore exact best checkpoint for {spec['name']}:", e)
-            print("Proceeding with current in-memory weights.")
+        best_path = f"{spec['ckpt']}-BEST.pt"
+        if os.path.exists(best_path):
+            model.restore(best_path, verbose=1)
+            print(f"Restored guaranteed-best weights for {spec['name']} (best_step={train_state.best_step}).")
+        else:
+            # Should only happen if training was interrupted before the first
+            # display_every checkpoint — fall back to the periodic snapshot, which
+            # may not exactly match best_step (see BestModelSaver docstring).
+            periodic_path = f"{spec['ckpt']}-{train_state.best_step}.pt"
+            try:
+                model.restore(periodic_path, verbose=1)
+                print(
+                    f"No BEST file found for {spec['name']}; restored periodic checkpoint at "
+                    f"{periodic_path} instead (may not exactly match best_step)."
+                )
+            except Exception as e:
+                print(f"Could not restore best or periodic checkpoint for {spec['name']}:", e)
+                print("Proceeding with current in-memory weights.")
 
         y_pred = predict_in_chunks(model, x_test, branch_chunk=BATCH_SIZE, time_chunk=TIMESTEP_BATCH_SIZE)
 

@@ -448,6 +448,37 @@ def _build_fourier_decoder():
     return FourierDecoder(modes1=10, modes2=10, width=36, width2=128)
 
 
+class BestModelSaver(dde.callbacks.Callback):
+    """Saves net/optimizer state exactly when train_state.best_step advances to the
+    current step. ModelCheckpoint's own save_better_only+period only checks for an
+    improvement every `period` steps — and its `monitor` can be a different quantity
+    than best_step's (best_step is always picked by train loss, hardcoded in
+    TrainState.update_best(); ModelCheckpoint may be watching test loss instead) — so
+    the periodic checkpoint file can silently miss, or never match, the exact step
+    DeepXDE itself reports as best. This file is written in the same format
+    Model.save()/restore() use, so model.restore(this_path) works unchanged, and it
+    always corresponds exactly to train_state.best_step at the time of writing.
+    """
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+        self._last_saved_step = None
+
+    def on_epoch_end(self):
+        ts = self.model.train_state
+        if ts.best_step == ts.step and ts.best_step != self._last_saved_step:
+            torch.save(
+                {
+                    "model_state_dict": self.model.net.state_dict(),
+                    "optimizer_state_dict": self.model.opt.state_dict(),
+                    "best_step": ts.best_step,
+                },
+                self.filepath,
+            )
+            self._last_saved_step = ts.best_step
+
+
 # ============================================================
 # Load + normalize data (fall back to a smaller size if RAM/VRAM can't hold it)
 # ============================================================
@@ -614,13 +645,17 @@ BATCH_SIZE = 4
 TIMESTEP_BATCH_SIZE = 8
 TRAINING_TIME_SIZE = 24
 DISPLAY_EVERY = 10
-# Preserving the original dP script's optimizer/lr/decay character (rmsprop, gamma=0.9,
-# many small decays) rather than sg's adam/5e-4/single-halving — just rescaled to this
-# much shorter 1200-iteration local run. The original decayed every 3375 of 168750
-# steps (50 times total); keep that same ~2% cadence here instead of the raw constant,
-# which wouldn't fire even once within 1200 steps.
+# Preserving the original dP script's optimizer/decay-rate character (rmsprop,
+# gamma=0.9) but NOT its decay cadence. Rescaling the original "decay every 3375 of
+# 168750 steps" ratio down to this 1200-iteration run gave DECAY_STEP=24 — 50 decay
+# events crammed into 1200 steps, collapsing LR to ~7% of initial by the halfway
+# point and ~0.5% by the end. That starved the model of any real optimization budget
+# for the back half of training (confirmed: test R2 flat/negative from ~step 150
+# onward while train loss kept slowly falling — classic frozen-LR-plus-overfitting).
+# Match sg's formula instead: few, large-effect decays sized to the actual iteration
+# budget, not a ratio inherited from a 140x-longer original run.
 LR = 1e-3
-DECAY_STEP = max(1, int(ITERATIONS * (3375 / 168750)))
+DECAY_STEP = int(0.4 * ITERATIONS)
 DECAY_GAMMA = 0.9
 
 MODEL_SPECS = [
@@ -680,10 +715,20 @@ if __name__ == "__main__":
         )
 
         # Preserved from the original: monitor="test loss" (sg's checkpointer defaults
-        # to train loss instead).
+        # to train loss instead). Note this means the periodic checkpoint's own
+        # save_better_only bookkeeping watches a DIFFERENT quantity than best_step
+        # (which is always train-loss-based, hardcoded in TrainState.update_best()) —
+        # exactly why BestModelSaver below exists: it's the only thing guaranteed to
+        # match best_step regardless of what `checker` is monitoring.
         checker = dde.callbacks.ModelCheckpoint(
             spec["ckpt"], save_better_only=True, period=50, monitor="test loss"
         )
+        best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
+        # Added alongside the LR-decay fix above: without this, nothing stopped
+        # training from grinding through all 1200 steps on the same 400 samples
+        # once test performance plateaued. Matches sg's config and criterion
+        # (train loss, same as best_step's own tracking).
+        early_stopping = dde.callbacks.EarlyStopping(min_delta=1e-4, patience=100)
 
         print(f"Training {spec['name']}...")
         start_time = time.time()
@@ -694,7 +739,7 @@ if __name__ == "__main__":
             training_time_size=TRAINING_TIME_SIZE,
             display_every=DISPLAY_EVERY,
             init_test=True,
-            callbacks=[checker],
+            callbacks=[checker, best_saver, early_stopping],
         )
         elapsed = time.time() - start_time
         steps_run = max(train_state.step, 1)
@@ -704,11 +749,24 @@ if __name__ == "__main__":
         print(f"{spec['name']} best test loss:", train_state.best_loss_test)
         print(f"{spec['name']} best test metric:", train_state.best_metrics)
 
-        try:
-            model.restore(f"{spec['ckpt']}-{train_state.best_step}.pt", verbose=1)
-        except Exception as e:
-            print(f"Could not restore exact best checkpoint for {spec['name']}:", e)
-            print("Proceeding with current in-memory weights.")
+        best_path = f"{spec['ckpt']}-BEST.pt"
+        if os.path.exists(best_path):
+            model.restore(best_path, verbose=1)
+            print(f"Restored guaranteed-best weights for {spec['name']} (best_step={train_state.best_step}).")
+        else:
+            # Should only happen if training was interrupted before the first
+            # display_every checkpoint — fall back to the periodic snapshot, which
+            # may not exactly match best_step (see BestModelSaver docstring).
+            periodic_path = f"{spec['ckpt']}-{train_state.best_step}.pt"
+            try:
+                model.restore(periodic_path, verbose=1)
+                print(
+                    f"No BEST file found for {spec['name']}; restored periodic checkpoint at "
+                    f"{periodic_path} instead (may not exactly match best_step)."
+                )
+            except Exception as e:
+                print(f"Could not restore best or periodic checkpoint for {spec['name']}:", e)
+                print("Proceeding with current in-memory weights.")
 
         y_pred = predict_in_chunks(model, x_test, branch_chunk=BATCH_SIZE, time_chunk=TIMESTEP_BATCH_SIZE)
 
