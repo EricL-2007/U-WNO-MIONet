@@ -13,3 +13,4 @@ __pycache__/
 *.log
 comparison_log.csv
 comparison_log_dp.csv
+plots_from_delta_v2/
