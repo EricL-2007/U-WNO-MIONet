@@ -142,6 +142,26 @@ def MAE_plume(y_true, y_pred):
 # ============================================================
 # Data
 # ============================================================
+#  dP_train_u.npz on disk is NOT raw pressure -- confirmed by direct inspection: its
+#  values are already ~N(0, 1) (mean 6.9e-5, std 0.999), and its dominant constant value
+#  (-0.22228621, ~67% of cells) exactly matches OUT_OF_DOMAIN_SENTINEL above. dP_test_u.npz
+#  on disk IS raw physical pressure (bar) -- mean 4.36, std 19.9, with ~65% of cells
+#  exactly 0.0 (the raw out-of-domain fill value). These two constants reproduce that
+#  exact mapping: (0.0 - DP_TARGET_MEAN) / DP_TARGET_STD == -0.22228620..., matching
+#  OUT_OF_DOMAIN_SENTINEL to 8 decimal places. So train and test were, at some point
+#  upstream, meant to be on the same normalized scale via this exact transform -- it's
+#  the same transform an earlier version of this script applied to y_test only (see the
+#  removed-code note this replaces), which a later change dropped on the theory that it
+#  was an inconsistency bug. It wasn't: dropping it left y_test raw (up to 445) being
+#  compared against a model trained entirely on y_train's already-normalized ~[-1.4, 25]
+#  scale, and left OUT_OF_DOMAIN_SENTINEL unable to match test's mask cells at all. Set
+#  DP_RESCALE_TEST_TARGETS=0 to disable this and reproduce the old (broken) behavior for
+#  A/B comparison.
+DP_TARGET_MEAN = 4.172939172019009
+DP_TARGET_STD = 18.772821433027488
+RESCALE_TEST_TARGETS = os.environ.get("DP_RESCALE_TEST_TARGETS", "1") != "0"
+
+
 def get_data(ntrain, ntest):
     t = np.linspace(0, 1, 24).astype(np.float32)
     xrt = np.array([[c] for c in t]).astype(np.float32)
@@ -167,18 +187,40 @@ def get_data(ntrain, ntest):
     x_test_MIO = np.load("dP_test_a_MIO.npy")[-ntest:, :].astype(np.float32)
     x_test = (x_test_field, x_test_MIO, xrt)
 
-    y_test = (
+    y_test_raw = (
         np.load("dP_test_u.npz")["dP_test_u"][-ntest:, :, :, :]
         .transpose(0, 3, 1, 2)
         .reshape(ntest, 24 * 96 * 200)
         .astype(np.float32)
     )
-    # NB: the original script subtracted/divided y_test here by two hardcoded constants
-    # (4.172939172019009, 18.772821433027488) but left y_train untouched, and never
-    # called apply_output_transform on the net. That desynced train/test scale (the
-    # net's raw output matched raw y_train, but got compared against shifted/scaled
-    # y_test) and broke the OUT_OF_DOMAIN_SENTINEL match for pre_mask_test downstream.
-    # Dropped in favor of a proper, consistently-applied output_transform below.
+
+    print(
+        f"[dP target scale] y_train (as loaded, already normalized upstream): "
+        f"mean={y_train.mean():.6g} std={y_train.std():.6g} "
+        f"min={y_train.min():.6g} max={y_train.max():.6g}"
+    )
+    print(
+        f"[dP target scale] y_test  (as loaded, RAW physical bar):           "
+        f"mean={y_test_raw.mean():.6g} std={y_test_raw.std():.6g} "
+        f"min={y_test_raw.min():.6g} max={y_test_raw.max():.6g}"
+    )
+    if RESCALE_TEST_TARGETS:
+        y_test = ((y_test_raw - DP_TARGET_MEAN) / DP_TARGET_STD).astype(np.float32)
+        print(
+            f"[dP target scale] DP_RESCALE_TEST_TARGETS=1: rescaled y_test with "
+            f"(raw - {DP_TARGET_MEAN}) / {DP_TARGET_STD} -> "
+            f"mean={y_test.mean():.6g} std={y_test.std():.6g} "
+            f"min={y_test.min():.6g} max={y_test.max():.6g} "
+            f"(now matches y_train's scale, and 0.0 maps to {(0.0 - DP_TARGET_MEAN) / DP_TARGET_STD:.8f} "
+            f"~= OUT_OF_DOMAIN_SENTINEL={OUT_OF_DOMAIN_SENTINEL})"
+        )
+    else:
+        y_test = y_test_raw
+        print(
+            "[dP target scale] DP_RESCALE_TEST_TARGETS=0: using RAW y_test unchanged "
+            "(reproduces prior broken behavior -- train/test on mismatched scales, "
+            "OUT_OF_DOMAIN_SENTINEL will not match test's mask cells)."
+        )
 
     return x_train, y_train, x_test, y_test, grid_x
 
