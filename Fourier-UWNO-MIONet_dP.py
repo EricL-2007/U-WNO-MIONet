@@ -471,18 +471,22 @@ class WrappedTrunk(nn.Module):
         return self.trunk(x)
 
 
+# dP is a smoother, more diffuse field than sg's sharp CO2 plume fronts, and this decoder
+# dominates the model's parameter count almost entirely (WaveConv2d's wavelet-domain
+# weights scale with the padded [104, 208] grid and level, not with the FC head) -- see
+# DP_WNO_LAYERS below. width=36 is NOT a free parameter here: it's the branch/trunk merge
+# output width shared with Fourier-MIONet's decoder too (see build_net's layer_sizes_*),
+# so changing it would require adding a projection layer into the decoder, confounding a
+# capacity change with an architecture change. layers is the one cleanly isolated capacity
+# knob available without touching branch/trunk/merge.
+DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "4"))
+
+
 def _build_wavelet_decoder():
-    dec = WaveletDecoder(width=36, level=4, size=[104, 208], wavelet="db6", layers=4, width2=128)
-    dec.set_unet(
-        nn.ModuleList(
-            [
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-            ]
-        )
+    dec = WaveletDecoder(
+        width=36, level=4, size=[104, 208], wavelet="db6", layers=DP_WNO_LAYERS, width2=128
     )
+    dec.set_unet(nn.ModuleList([U_net(36, 36, 3, 0.0) for _ in range(DP_WNO_LAYERS)]))
     return dec
 
 
@@ -739,6 +743,9 @@ if __name__ == "__main__":
         # (BatchSampler draws from the global np.random state).
         reset_seed(SEED)
         net = build_net(spec["decoder_builder"], output_transform)
+        n_params = sum(p.numel() for p in net.parameters())
+        extra = f" (DP_WNO_LAYERS={DP_WNO_LAYERS})" if spec["key"] == "wno" else ""
+        print(f"[param count] {spec['name']}: {n_params:,} total params{extra}")
 
         reset_seed(SEED)
         # Preserved from the original dP script: QuadrupleCartesianProd (not Quadruple)
