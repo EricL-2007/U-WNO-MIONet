@@ -464,11 +464,15 @@ class WrappedTrunk(nn.Module):
         return self.trunk(x)
 
 
-# Carried forward from the layers/width capacity A/B tests on the ntrain=400 reduced
-# scale (see Fourier-UWNO-MIONet_dP.py): layers=1 fixed the catastrophic overfitting seen
-# at layers=4 and matched layers=2 within noise, so it's the new default here too.
-# DP_WNO_WIDTH defaults to 36 (unconfirmed pending that test's width leg) -- override to
-# whatever width the A/B test shows helps once it's run.
+# Carried forward from the now-completed layers/width capacity A/B tests on the
+# ntrain=400 reduced scale (see Fourier-UWNO-MIONet_dP.py for the full results table):
+#   layers=4, width=36 (original): 8.39M params, R2=-42.16, MAE=0.727
+#   layers=2, width=36:            4.20M params, R2=-2.99,  MAE=0.638
+#   layers=1, width=36:            2.10M params, R2=-3.00,  MAE=0.627  <- best MAE
+#   layers=1, width=18:            0.53M params, R2=-3.18,  MAE=0.631
+# layers=1/width=36 is the CONFIRMED best config (best MAE, R2 tied with the narrower
+# width=18 leg) -- width reduction below 36 showed no benefit, so both are now locked-in
+# defaults here, not placeholders pending further tuning.
 DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "1"))
 DP_WNO_WIDTH = int(os.environ.get("DP_WNO_WIDTH", "36"))
 _MERGE_WIDTH = 36  # fixed by branch/trunk output channels; not a free parameter

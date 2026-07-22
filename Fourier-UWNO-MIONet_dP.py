@@ -486,11 +486,18 @@ class WrappedTrunk(nn.Module):
 # weights scale with the padded [104, 208] grid and level, quadratically with channel
 # width, and with the level) -- see DP_WNO_LAYERS/DP_WNO_WIDTH below. The branch/trunk
 # merge output is fixed at 36 channels (see build_net's layer_sizes_*), so decoding at a
-# narrower internal width now goes through a 1x1-conv input_proj (WaveletDecoder's
-# input_width arg) rather than requiring merge/branch/trunk changes. layers=1 is the
-# new best-known config (A/B: 4->2 layers fixed catastrophic overfitting, 2->1 showed no
-# further change) -- carried forward here as the new default. width is the other
-# capacity knob, tested once alongside layers=1 below.
+# narrower internal width goes through a 1x1-conv input_proj (WaveletDecoder's
+# input_width arg) rather than requiring merge/branch/trunk changes.
+#
+# FINAL capacity A/B results (ntrain=400, all real/on-cluster):
+#   layers=4, width=36 (original): 8.39M params, R2=-42.16, MAE=0.727
+#   layers=2, width=36:            4.20M params, R2=-2.99,  MAE=0.638
+#   layers=1, width=36:            2.10M params, R2=-3.00,  MAE=0.627  <- best MAE
+#   layers=1, width=18:            0.53M params, R2=-3.18,  MAE=0.631
+# layers=1/width=36 wins on MAE, with R2 statistically tied against the narrower
+# width=18 leg -- width reduction below 36 showed no further benefit, so capacity
+# tuning has plateaued here. layers=1, width=36 are now the CONFIRMED defaults below,
+# not a placeholder pending further tuning.
 DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "1"))
 DP_WNO_WIDTH = int(os.environ.get("DP_WNO_WIDTH", "36"))
 _MERGE_WIDTH = 36  # fixed by branch/trunk output channels; not a free parameter

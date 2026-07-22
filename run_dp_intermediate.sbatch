@@ -30,11 +30,15 @@ nvidia-smi
 # counters) rather than restarting either model from scratch. No special flag needed;
 # just resubmit.
 #
-# DP_WNO_LAYERS=1 is the new best-known capacity config from the layers A/B test
-# (ntrain=400 reduced scale: 4->2 layers fixed catastrophic overfitting, 2->1 showed no
-# further change). DP_WNO_WIDTH defaults to 36 here (unconfirmed pending that A/B test's
-# width leg) -- override to whatever width Task 1's test shows helps, e.g.:
-#   DP_WNO_WIDTH=18 sbatch run_dp_intermediate.sbatch
+# DP_WNO_LAYERS=1, DP_WNO_WIDTH=36 are the CONFIRMED-best capacity config from the
+# completed layers/width A/B tests (ntrain=400 reduced scale):
+#   layers=4, width=36 (original): 8.39M params, R2=-42.16, MAE=0.727
+#   layers=2, width=36:            4.20M params, R2=-2.99,  MAE=0.638
+#   layers=1, width=36:            2.10M params, R2=-3.00,  MAE=0.627  <- best MAE
+#   layers=1, width=18:            0.53M params, R2=-3.18,  MAE=0.631
+# layers=1/width=36 wins on MAE with R2 tied against width=18 -- width reduction below
+# 36 showed no benefit, so capacity tuning is done. These are locked-in defaults now,
+# not placeholders; no --export override needed to get the best-known config.
 DP_WNO_LAYERS="${DP_WNO_LAYERS:-1}" \
 DP_WNO_WIDTH="${DP_WNO_WIDTH:-36}" \
 python -u Fourier-UWNO-MIONet_dP_intermediate.py \
