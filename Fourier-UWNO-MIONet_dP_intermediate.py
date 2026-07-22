@@ -1,3 +1,27 @@
+"""Intermediate data-scale test for dP (pressure buildup): ntrain=1000 (up from the
+400 used for the layers/width capacity A/B tests), carrying forward whichever capacity
+config those tests found best (DP_WNO_LAYERS/DP_WNO_WIDTH env vars, same as
+Fourier-UWNO-MIONet_dP.py). This is a cheap DIRECTIONAL check (~20-30 epoch-equivalents,
+not sg's full 75-epoch scale-up) meant to show whether more data is worth pursuing
+further before committing a longer run.
+
+Reuses the resumability infrastructure (ResumeCheckpoint, ResumableEarlyStopping,
+EarlyTimingProbe, the EARLY_STOP_PATIENCE_CHECKS display_every-aware patience fix) built
+for Fourier-UWNO-MIONet_sg.py's scale-up, ported here unchanged. dP's own architecture
+choices (QuadrupleCartesianProd full-24-timestep batching, rmsprop, the masked
+relative-L2 + radial-derivative loss, the RESCALE_TEST_TARGETS train/test scale fix) are
+preserved from Fourier-UWNO-MIONet_dP.py, NOT replaced with sg's (adam, plain
+"mean l2 relative error", Quadruple) -- those are dP-specific fixes/characteristics
+unrelated to the data-scale question this script tests.
+
+Usage:
+    python Fourier-UWNO-MIONet_dP_intermediate.py [--ntrain 1000] [--ntest 80]
+        [--batch-size 10] [--timestep-batch-size 8] [--iterations 2500] ...
+
+DO NOT run the full-scale version of this without first checking the timing probe
+output ([timing] ... s/step) against the requested --time budget -- see
+run_dp_intermediate.sbatch.
+"""
 import os
 os.environ["DDE_BACKEND"] = "pytorch"
 
@@ -39,8 +63,6 @@ reset_seed(SEED)
 # Device
 # ============================================================
 if os.environ.get("FORCE_CPU") == "1":
-    # Escape hatch for MPS backward-pass bugs on specific op combinations (e.g. the
-    # WaveletDecoder's layer-0 U-Net branch) — not needed on CUDA, so leave unset there.
     device = torch.device("cpu")
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
@@ -61,6 +83,12 @@ else:
 # ============================================================
 # Metrics
 # ============================================================
+# Pressure is defined everywhere (unlike gas saturation), but the padded grid still
+# has out-of-domain cells filled with this sentinel value; mask those out rather than
+# scoring against padding. Ported unchanged from Fourier-UWNO-MIONet_dP.py.
+OUT_OF_DOMAIN_SENTINEL = -0.22228621
+
+
 def max_l2_relative_error(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -84,16 +112,15 @@ def mean_l2_relative_error_np(y_true, y_pred):
 
 
 def Rsquare_plume_tegother(y_true, y_pred):
-    """R^2 restricted to the CO2 plume region (saturation ~0 at final timestep is masked
-    out). Ported from baselines/MIONet_vanilla_SG.py so both models are scored the same
-    way the original paper code scored Fourier-MIONet."""
+    """R^2 outside the out-of-domain padding, pooling all timesteps per sample before
+    averaging over samples. Ported unchanged from Fourier-UWNO-MIONet_dP.py."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     r2 = 0.0
     for i in range(size):
         z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, 0.0)
+        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
         y_true_i = y_true[i][:, mask, :]
         y_pred_i = y_pred[i][:, mask, :]
         sse = np.sum(np.square(y_true_i.flatten() - y_pred_i.flatten()))
@@ -103,14 +130,14 @@ def Rsquare_plume_tegother(y_true, y_pred):
 
 
 def MAE_plume(y_true, y_pred):
-    """MAE restricted to the CO2 plume region, same masking as Rsquare_plume_tegother."""
+    """MAE outside the out-of-domain padding, same masking as Rsquare_plume_tegother."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     mae = 0.0
     for i in range(size):
         z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, 0.0)
+        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
         y_true_i = y_true[i][:, mask, :]
         y_pred_i = y_pred[i][:, mask, :]
         mae += np.mean(np.abs(y_true_i.flatten() - y_pred_i.flatten()))
@@ -120,37 +147,74 @@ def MAE_plume(y_true, y_pred):
 # ============================================================
 # Data
 # ============================================================
+# See Fourier-UWNO-MIONet_dP.py for the full derivation of these two constants: train
+# targets are already normalized on disk, test targets are raw physical pressure (bar),
+# and this rescale puts them on the same scale (and makes 0.0 map back onto
+# OUT_OF_DOMAIN_SENTINEL). Set DP_RESCALE_TEST_TARGETS=0 to disable for A/B comparison.
+DP_TARGET_MEAN = 4.172939172019009
+DP_TARGET_STD = 18.772821433027488
+RESCALE_TEST_TARGETS = os.environ.get("DP_RESCALE_TEST_TARGETS", "1") != "0"
+
+
 def get_data(ntrain, ntest):
     t = np.linspace(0, 1, 24).astype(np.float32)
     xrt = np.array([[c] for c in t]).astype(np.float32)
 
     field_input = [True, True, True, False, False, False, False, False, False, True, True]
 
-    train_a_raw = np.load("sg_train_a.npz")["sg_train_a"]
-    test_a_raw = np.load("sg_test_a.npz")["sg_test_a"]
+    train_a_raw = np.load("dP_train_a.npz")["dP_train_a"]
+    test_a_raw = np.load("dP_test_a.npz")["dP_test_a"]
 
     x_train_field = train_a_raw[:ntrain, :, :, field_input].astype(np.float32)
-    x_train_MIO = np.load("sg_train_a_MIO.npy")[:ntrain, :].astype(np.float32)
+    x_train_MIO = np.load("dP_train_a_MIO.npy")[:ntrain, :].astype(np.float32)
     grid_x = train_a_raw[0, 0, :, -2].astype(np.float32)
     x_train = (x_train_field, x_train_MIO, xrt)
 
     y_train = (
-        np.load("sg_train_u.npz")["sg_train_u"][:ntrain, :, :, :]
+        np.load("dP_train_u.npz")["dP_train_u"][:ntrain, :, :, :]
         .transpose(0, 3, 1, 2)
         .reshape(ntrain, 24 * 96 * 200)
         .astype(np.float32)
     )
 
     x_test_field = test_a_raw[-ntest:, :, :, field_input].astype(np.float32)
-    x_test_MIO = np.load("sg_test_a_MIO.npy")[-ntest:, :].astype(np.float32)
+    x_test_MIO = np.load("dP_test_a_MIO.npy")[-ntest:, :].astype(np.float32)
     x_test = (x_test_field, x_test_MIO, xrt)
 
-    y_test = (
-        np.load("sg_test_u.npz")["sg_test_u"][-ntest:, :, :, :]
+    y_test_raw = (
+        np.load("dP_test_u.npz")["dP_test_u"][-ntest:, :, :, :]
         .transpose(0, 3, 1, 2)
         .reshape(ntest, 24 * 96 * 200)
         .astype(np.float32)
     )
+
+    print(
+        f"[dP target scale] y_train (as loaded, already normalized upstream): "
+        f"mean={y_train.mean():.6g} std={y_train.std():.6g} "
+        f"min={y_train.min():.6g} max={y_train.max():.6g}"
+    )
+    print(
+        f"[dP target scale] y_test  (as loaded, RAW physical bar):           "
+        f"mean={y_test_raw.mean():.6g} std={y_test_raw.std():.6g} "
+        f"min={y_test_raw.min():.6g} max={y_test_raw.max():.6g}"
+    )
+    if RESCALE_TEST_TARGETS:
+        y_test = ((y_test_raw - DP_TARGET_MEAN) / DP_TARGET_STD).astype(np.float32)
+        print(
+            f"[dP target scale] DP_RESCALE_TEST_TARGETS=1: rescaled y_test with "
+            f"(raw - {DP_TARGET_MEAN}) / {DP_TARGET_STD} -> "
+            f"mean={y_test.mean():.6g} std={y_test.std():.6g} "
+            f"min={y_test.min():.6g} max={y_test.max():.6g} "
+            f"(now matches y_train's scale, and 0.0 maps to {(0.0 - DP_TARGET_MEAN) / DP_TARGET_STD:.8f} "
+            f"~= OUT_OF_DOMAIN_SENTINEL={OUT_OF_DOMAIN_SENTINEL})"
+        )
+    else:
+        y_test = y_test_raw
+        print(
+            "[dP target scale] DP_RESCALE_TEST_TARGETS=0: using RAW y_test unchanged "
+            "(reproduces prior broken behavior -- train/test on mismatched scales, "
+            "OUT_OF_DOMAIN_SENTINEL will not match test's mask cells)."
+        )
 
     return x_train, y_train, x_test, y_test, grid_x
 
@@ -283,10 +347,17 @@ class U_net(nn.Module):
 
 
 class WaveletDecoder(nn.Module):
-    def __init__(self, width, level, size, wavelet, layers=4, width2=128):
+    def __init__(self, width, level, size, wavelet, layers=4, width2=128, input_width=None):
         super().__init__()
         self.layers = layers
         self.width = width
+        # input_width is the branch/trunk merge output's fixed channel count (36, see
+        # DP_WNO_WIDTH below). When it differs from this decoder's internal `width`, a
+        # 1x1-conv projection is needed at the entry point, since every WaveConv2d/U_net
+        # block below operates at `width` channels internally.
+        self.input_proj = (
+            nn.Conv2d(input_width, width, 1) if input_width is not None and input_width != width else None
+        )
         self.a = nn.Parameter(torch.FloatTensor([0.1]))
         self.conv = nn.ModuleList(
             [WaveConv2d(width, width, level, size, wavelet, mode="zero") for _ in range(layers)]
@@ -306,15 +377,14 @@ class WaveletDecoder(nn.Module):
         if x.shape[0] == 0:
             return torch.zeros(0, 96, 200, device=x.device, dtype=x.dtype)
 
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+
         batchsize = x.shape[0]
         size_x, size_y = x.shape[2], x.shape[3]
         r = x
 
         for j, (convl, wl) in enumerate(zip(self.conv, self.w)):
-            # Aligned to the reference UWNO2d (U-WNO/uwno2d_Darcy.py): a real U-Net
-            # block and the "+r" residual are applied uniformly at every layer,
-            # including layer 0 (this used to special-case layer 0 with no unet and
-            # no residual).
             x = convl(x + r) + wl(x) + self.unet[j](x)
 
             if j != self.layers - 1:
@@ -328,10 +398,7 @@ class WaveletDecoder(nn.Module):
 
 
 class FourierDecoder(nn.Module):
-    """Vanilla Fourier-MIONet decoder baseline (SpectralConv2d + U_net, no wavelets).
-    Ported from the active forward path of `decoder` in Fourier-UWNO-MIONet_dP.py (that class
-    also allocated conv1/conv2/conv4/conv5/unet4/unet5, but its forward() never used
-    them, so they are dropped here to keep the parameter-count comparison honest)."""
+    """Vanilla Fourier-MIONet decoder baseline (SpectralConv2d + U_net, no wavelets)."""
 
     def __init__(self, modes1, modes2, width, width2):
         super().__init__()
@@ -345,9 +412,6 @@ class FourierDecoder(nn.Module):
         self.fc2 = nn.Linear(width2, 1)
 
     def forward(self, x):
-        # NB: don't use next(self.parameters()) for dtype/device here — conv0's
-        # SpectralConv2d weights are registered first and are torch.cfloat, which
-        # would silently cast this real-valued input to complex.
         p = self.w0.weight
         x = torch.as_tensor(x, device=p.device, dtype=p.dtype)
 
@@ -400,18 +464,27 @@ class WrappedTrunk(nn.Module):
         return self.trunk(x)
 
 
+# Carried forward from the layers/width capacity A/B tests on the ntrain=400 reduced
+# scale (see Fourier-UWNO-MIONet_dP.py): layers=1 fixed the catastrophic overfitting seen
+# at layers=4 and matched layers=2 within noise, so it's the new default here too.
+# DP_WNO_WIDTH defaults to 36 (unconfirmed pending that test's width leg) -- override to
+# whatever width the A/B test shows helps once it's run.
+DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "1"))
+DP_WNO_WIDTH = int(os.environ.get("DP_WNO_WIDTH", "36"))
+_MERGE_WIDTH = 36  # fixed by branch/trunk output channels; not a free parameter
+
+
 def _build_wavelet_decoder():
-    dec = WaveletDecoder(width=36, level=4, size=[104, 208], wavelet="db6", layers=4, width2=128)
-    dec.set_unet(
-        nn.ModuleList(
-            [
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-                U_net(36, 36, 3, 0.0),
-            ]
-        )
+    dec = WaveletDecoder(
+        width=DP_WNO_WIDTH,
+        level=4,
+        size=[104, 208],
+        wavelet="db6",
+        layers=DP_WNO_LAYERS,
+        width2=128,
+        input_width=_MERGE_WIDTH,
     )
+    dec.set_unet(nn.ModuleList([U_net(DP_WNO_WIDTH, DP_WNO_WIDTH, 3, 0.0) for _ in range(DP_WNO_LAYERS)]))
     return dec
 
 
@@ -420,63 +493,36 @@ def _build_fourier_decoder():
 
 
 class BestModelSaver(dde.callbacks.Callback):
-    """Saves net/optimizer state whenever `monitor` improves over its own best-so-far
-    value, tracked independently of dde.model.TrainState.best_step.
+    """Saves net/optimizer state exactly when train_state.best_step advances to the
+    current step -- see Fourier-UWNO-MIONet_sg.py's identical class for the full
+    rationale (ModelCheckpoint's save_better_only+period can miss or mismatch
+    best_step, which is always train-loss-based)."""
 
-    This USED to key off train_state.best_step ("save exactly when best_step advances
-    to the current step"), but best_step is unconditionally train-loss-based --
-    TrainState.update_best() hardcodes `if self.best_loss_train > np.sum(self.loss_train)`
-    with no monitor argument at all, so no ModelCheckpoint/EarlyStopping `monitor` setting
-    anywhere else in this file could ever change what best_step tracks. That silently
-    defeated the entire point of a test-loss-based "best" checkpoint: diagnosed on the
-    ntrain=2000/batch_size=20 U-WNO-MIONet run, where train loss kept slowly improving
-    (0.894 -> 0.352 over the first 1500 steps) while test loss/R2 catastrophically
-    diverged (R2: 0.131 -> -26.3) -- best_step kept advancing on every train-loss
-    improvement, so the old best_step-keyed saver kept overwriting BEST.pt with newer,
-    badly-overfit weights instead of preserving the healthy early checkpoint.
-
-    monitor="test loss" (the new default) fixes this: `current` is compared directly
-    against this callback's own running `best`, so a checkpoint is only kept when test
-    loss itself improves, regardless of what train loss or best_step are doing.
-    """
-
-    def __init__(self, filepath, monitor="test loss", resume_best=None):
+    def __init__(self, filepath):
         super().__init__()
         self.filepath = filepath
-        self.monitor = monitor
-        self.best = resume_best if resume_best is not None else np.inf
-
-    def _current(self):
-        ts = self.model.train_state
-        if self.monitor == "test loss":
-            return float(np.sum(ts.loss_test))
-        elif self.monitor == "train loss":
-            return float(np.sum(ts.loss_train))
-        else:
-            raise ValueError(f"Unsupported monitor: {self.monitor!r}")
+        self._last_saved_step = None
 
     def on_epoch_end(self):
-        current = self._current()
-        if current < self.best:
-            self.best = current
+        ts = self.model.train_state
+        if ts.best_step == ts.step and ts.best_step != self._last_saved_step:
             torch.save(
                 {
                     "model_state_dict": self.model.net.state_dict(),
                     "optimizer_state_dict": self.model.opt.state_dict(),
-                    "step": self.model.train_state.step,
-                    "monitor": self.monitor,
-                    "monitor_value": current,
+                    "best_step": ts.best_step,
                 },
                 self.filepath,
             )
+            self._last_saved_step = ts.best_step
 
 
 class ResumableEarlyStopping(dde.callbacks.EarlyStopping):
-    """Identical to dde.callbacks.EarlyStopping, except on_train_begin only resets
-    wait/best/stopped_epoch to their fresh-start defaults when no resumed values were
-    supplied at construction time. Model.train() calls on_train_begin() unconditionally
-    at the start of every .train() call -- including a resumed one -- so without this
-    override, resuming would silently wipe the exact counters we're trying to resume."""
+    """Ported unchanged from Fourier-UWNO-MIONet_sg.py: identical to
+    dde.callbacks.EarlyStopping, except on_train_begin only resets wait/best/
+    stopped_epoch to fresh-start defaults when no resumed values were supplied at
+    construction time (Model.train() calls on_train_begin() unconditionally, including
+    on a resumed run)."""
 
     def __init__(self, *args, resume_wait=None, resume_best=None, resume_stopped_epoch=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -495,39 +541,16 @@ class ResumableEarlyStopping(dde.callbacks.EarlyStopping):
 
 
 class ResumeCheckpoint(dde.callbacks.Callback):
-    """Periodically persists everything needed to resume training after a Slurm
-    preemption/timeout on the 48-hour partition -- not just net/optimizer weights
-    (which Model.save()/restore() and BestModelSaver already handle), but also:
+    """Ported unchanged from Fourier-UWNO-MIONet_sg.py: periodically persists net/
+    optimizer/LR-scheduler state plus TrainState/EarlyStopping/LossHistory bookkeeping,
+    so a Slurm preemption/timeout can resume without losing the decay schedule, the
+    "best so far" tracking, or the per-checkpoint comparison CSV's earlier rows."""
 
-    - The LR scheduler's own state. `decay=("step", ...)` builds a separate
-      torch.optim.lr_scheduler.StepLR object (model.lr_scheduler) with its own
-      internal step counter (last_epoch) -- Model.save()/restore() does NOT capture
-      it, so naively restoring only net+optimizer would reset the decay schedule to
-      start over from step 0, decoupling it from the actual resumed step.
-    - TrainState bookkeeping (step, best_step, best_loss_train/test) so the resumed
-      run knows how many iterations remain and doesn't reset "best so far".
-    - EarlyStopping's wait/best/stopped_epoch counters (see ResumableEarlyStopping).
-    - BestModelSaver's own running `best` value (see that class -- it's now tracked
-      independently of TrainState.best_step, so it must be persisted/restored
-      separately too, or a resumed run would reset it to inf and could overwrite
-      BEST.pt with a worse checkpoint than one already seen pre-resume).
-    - The LossHistory accumulated so far (steps/loss_train/loss_test/metrics_test) --
-      a resumed run gets a brand new dde.Model with an empty LossHistory, so without
-      this, the final per-checkpoint comparison CSV would silently lose every row
-      from before the resume point.
-
-    Two files, written together so they can't desync: a .pt for tensors (weights,
-    optimizer, scheduler) and a .json for everything JSON-serializable. `complete`
-    marks whether this model's training has fully finished (iterations exhausted or
-    EarlyStopping fired) -- checked on startup to skip re-training a finished model.
-    """
-
-    def __init__(self, json_path, weights_path, early_stopping, best_saver, save_every=50):
+    def __init__(self, json_path, weights_path, early_stopping, save_every=50):
         super().__init__()
         self.json_path = json_path
         self.weights_path = weights_path
         self.early_stopping = early_stopping
-        self.best_saver = best_saver
         self.save_every = save_every
 
     def _save(self, complete):
@@ -553,9 +576,6 @@ class ResumeCheckpoint(dde.callbacks.Callback):
                 "wait": self.early_stopping.wait,
                 "best": float(self.early_stopping.best),
                 "stopped_epoch": self.early_stopping.stopped_epoch,
-            },
-            "best_saver": {
-                "best": None if self.best_saver.best == np.inf else float(self.best_saver.best),
             },
             "losshistory": {
                 "steps": list(m.losshistory.steps),
@@ -596,11 +616,10 @@ def apply_resumed_history(model, resume_state):
 
 
 class EarlyTimingProbe(dde.callbacks.Callback):
-    """Prints a measured (not assumed/extrapolated) average seconds/step after the
-    first `probe_steps` real steps of THIS invocation -- so a short verification run
-    (e.g. --iterations 30) reports true per-step timing at the new batch_size before
-    committing GPU time to the full run, and a resumed run measures fresh rather than
-    reusing a stale pre-resume number."""
+    """Ported unchanged from Fourier-UWNO-MIONet_sg.py: prints a measured average
+    seconds/step after the first `probe_steps` real steps of THIS invocation, so real
+    timing at the new ntrain/batch_size is available before committing to a longer
+    run."""
 
     def __init__(self, label, probe_steps=20):
         super().__init__()
@@ -631,25 +650,18 @@ class EarlyTimingProbe(dde.callbacks.Callback):
 # ============================================================
 # Load + normalize data (fall back to a smaller size if RAM/VRAM can't hold it)
 # ============================================================
-# NTRAIN/NTEST are module-level (not local to `if __name__ == "__main__"`) because
-# generate_predictions_and_plots.py imports this file via importlib (its __name__ is
-# never "__main__", so the CLI-parsing block below never runs) and calls
-# load_and_normalize_data() directly for inference -- it needs these to already hold
-# whatever size the checkpoint was actually trained with. CLI args (see __main__)
-# override these two names directly, at module scope, before training starts. If you
-# override --ntrain/--ntest for a one-off run, re-running generate_predictions_and_plots.py
-# afterward will still use these defaults (2000/222), not your override -- pass the same
-# override there too, or the field/output normalizers will be refit on a mismatched split.
-NTRAIN, NTEST = 2000, 222
+# Module-level (not local to `if __name__ == "__main__"`) for the same reason as
+# Fourier-UWNO-MIONet_sg.py's NTRAIN/NTEST: any future inference/plotting script that
+# imports this file via importlib needs these to hold the actually-trained size. CLI
+# args in __main__ override these names directly, before training starts.
+NTRAIN, NTEST = 1000, 80
 # Historical smaller sizes, tried in order if a larger size hits a MemoryError.
 DATASET_FALLBACKS = [(400, 80), (200, 40)]
 
 
 def load_and_normalize_data():
     """Load train/test data and fit all normalizers on train only. Side-effect-free
-    beyond disk reads, so this is safe to call from other scripts (e.g. an inference/
-    plotting script) without triggering training — only `if __name__ == "__main__"`
-    below actually trains anything."""
+    beyond disk reads."""
     x_train = y_train = x_test = y_test = grid_x = None
     ntrain = ntest = None
     dataset_candidates = [(NTRAIN, NTEST)] + [
@@ -668,10 +680,6 @@ def load_and_normalize_data():
     if x_train is None:
         raise RuntimeError("Could not load any candidate dataset size — check available RAM.")
 
-    # branch1's field maps (incl. permeability spanning ~7 orders of magnitude) and
-    # branch2's scalar MIO features were previously fed in raw/unnormalized while only
-    # the output got a StandardScaler. That mismatch badly conditions the loss surface
-    # and is the likely cause of the ~0.73-0.75 test-metric plateau.
     x_train_field, x_train_MIO, xrt_train = x_train
     x_test_field, x_test_MIO, xrt_test = x_test
 
@@ -687,6 +695,10 @@ def load_and_normalize_data():
     std = np.sqrt(scaler.var_.astype(np.float32))
     std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
 
+    # grid_dx feeds the radial-derivative loss term.
+    grid_dx = grid_x[1:-1] + grid_x[:-2] / 2 + grid_x[2:] / 2
+    grid_dx = grid_dx.reshape(1, 1, 1, 198).astype(np.float32)
+
     return {
         "x_train": x_train,
         "y_train": y_train,
@@ -694,6 +706,7 @@ def load_and_normalize_data():
         "y_test": y_test,
         "x_test_field_raw": x_test_field,
         "grid_x": grid_x,
+        "grid_dx": grid_dx,
         "ntrain": ntrain,
         "ntest": ntest,
         "mean": mean,
@@ -711,6 +724,38 @@ def make_output_transform(mean, std):
         return outputs * std_t + mean_t
 
     return output_transform
+
+
+def make_loss_fnc(grid_dx, device):
+    """Relative-L2 + radial-derivative loss, masked outside the simulation domain.
+    Ported unchanged from Fourier-UWNO-MIONet_dP.py."""
+    grid_dx_t = torch.as_tensor(grid_dx, dtype=torch.float32, device=device)
+
+    def loss_fnc(y_true, y_pred):
+        size = y_true.shape[0]
+        timesize = int(y_true.shape[1] / 200 / 96)
+        y_true = y_true.reshape(size, timesize, 96, 200)
+        y_pred = y_pred.reshape(size, timesize, 96, 200)
+
+        z_axis = y_true[:, -1, :, 0]
+        sentinel = torch.as_tensor(OUT_OF_DOMAIN_SENTINEL, dtype=z_axis.dtype, device=z_axis.device)
+        mask = (~torch.isclose(z_axis, sentinel)).to(torch.float32)
+        mask = mask.reshape(size, 1, 96, 1)
+
+        y_true = y_true * mask
+        y_pred = y_pred * mask
+        dydx_true_x = (y_true[:, :, :, 2:] - y_true[:, :, :, :-2]) / grid_dx_t
+        dydx_pred_x = (y_pred[:, :, :, 2:] - y_pred[:, :, :, :-2]) / grid_dx_t
+        y_true = y_true.reshape(size, timesize * 96 * 200)
+        y_pred = y_pred.reshape(size, timesize * 96 * 200)
+        dydx_true_x = dydx_true_x.reshape(size, timesize * 96 * 198)
+        dydx_pred_x = dydx_pred_x.reshape(size, timesize * 96 * 198)
+        ori_loss = torch.mean(torch.norm(y_true - y_pred, 2, dim=1) / torch.norm(y_true, 2, dim=1))
+        der_loss_x = torch.mean(torch.norm(dydx_true_x - dydx_pred_x, 2, dim=1) / torch.norm(dydx_true_x, 2, dim=1))
+
+        return [ori_loss, der_loss_x]
+
+    return loss_fnc
 
 
 gelu = torch.nn.GELU()
@@ -742,11 +787,8 @@ def build_net(decoder_builder, output_transform):
 
 
 def predict_in_chunks(model, x_test, branch_chunk=4, time_chunk=8, training_time_size=24, nx=96, ny=200):
-    """model.predict() runs the whole batch through the network in one shot with no
-    internal chunking. For NTEST=80 x all 24 timesteps that materializes a
-    (n, T, 36, 104, 208) intermediate tensor several GB in size before the decoder even
-    runs. Chunk it the same way Model._test() chunks during training to keep peak memory
-    bounded regardless of NTEST."""
+    """Chunk prediction the same way Model._test() chunks during training, to keep
+    peak memory bounded for a large NTEST x all-24-timesteps call."""
     x1, x2, xt = x_test
     n = x1.shape[0]
     branch_chunks = []
@@ -761,81 +803,44 @@ def predict_in_chunks(model, x_test, branch_chunk=4, time_chunk=8, training_time
     return np.concatenate(branch_chunks, axis=0).reshape(n, -1)
 
 
-# Scaled-up run (per 2026-07-21 professor/PhD-student meeting guidance): ntrain=2000
-# (~44% of the paper's 4500), iterations=7500 (75 epochs at 100 batches/epoch = 50% of
-# the paper's 150-epoch schedule, the midpoint of the requested 40-60% range). All of
-# these are plain module-level globals (not local to `if __name__ == "__main__"`) for
-# the same reason NTRAIN/NTEST are above: generate_predictions_and_plots.py imports this
-# file without running the CLI block, and reads BATCH_SIZE/TIMESTEP_BATCH_SIZE directly.
-# CLI args in __main__ reassign these names in place before training starts.
-ITERATIONS = 7500
-BATCH_SIZE = 20  # ntrain/batch_size = 2000/20 = 100 batches/epoch
+# Intermediate data-scale test (per Task 2 spec): ntrain=1000 (2.5x the 400 used for the
+# layers/width capacity A/B tests, but well short of sg's ntrain=2000 scale-up),
+# batch_size=10 keeps the same 100-batches/epoch convention sg's scale-up uses
+# (1000/10 = 100, matching sg's 2000/20 = 100). ITERATIONS=2500 is ~25 epoch-equivalents
+# (25 * 100 = 2500) -- a modest, directional check, not the full 75-epoch target used for
+# sg. All CLI-overridable so a longer run can follow if this looks promising.
+NTRAIN, NTEST = 1000, 80
+ITERATIONS = 2500
+BATCH_SIZE = 10  # ntrain/batch_size = 1000/10 = 100 batches/epoch
 TIMESTEP_BATCH_SIZE = 8  # unchanged -- paper's own tested accuracy/memory sweet spot
 TRAINING_TIME_SIZE = 24
-DISPLAY_EVERY = 100  # 7500/100 = 75 printed rows, in the requested 50-100 range
-LR = 5e-4
-# Un-normalized inputs likely made the model bounce around a wide loss basin at the
-# original 1e-3 LR; now that inputs are normalized, drop LR and decay it partway
-# through training instead of holding it constant. Already a function of ITERATIONS,
-# not a hardcoded step count, so it scales automatically with the new budget (verified:
-# 0.4 * 7500 = 3000, still comfortably inside the run, same 40%-through-training point
-# as the previous 1200-iteration config's 480).
+DISPLAY_EVERY = 25  # 2500/25 = 100 printed rows
+LR = 1e-3
 DECAY_STEP = int(0.4 * ITERATIONS)
-DECAY_GAMMA = 0.5
+DECAY_GAMMA = 0.9
 
-# EarlyStopping's `patience` counts on_epoch_end() CALLS, which happen every single
-# training step -- not every display_every steps. But the monitored quantity
-# (train_state.loss_train) only actually CHANGES value at display_every cadence (that's
-# when Model._test() runs); in between, on_epoch_end() re-checks the same frozen value
-# against `best`, which reads as "no improvement" and increments `wait` on every one of
-# those steps too. So patience, in effect, buys you (patience / display_every) real
-# evaluation chances before firing -- not `patience` chances. The previous 1200-iteration
-# config (display_every=10, patience=100) had 10 real chances (~8% of its 120 total
-# checks). Scaling display_every to 100 for this run without also scaling patience would
-# silently collapse that to 1 real chance (100/100) -- EarlyStopping would fire after a
-# single non-improving evaluation, likely almost immediately. EARLY_STOP_PATIENCE_CHECKS
-# preserves the original 10-real-chances tolerance regardless of display_every.
+# See Fourier-UWNO-MIONet_sg.py's identical comment: patience counts on_epoch_end()
+# calls (every step), but the monitored quantity only changes at display_every cadence,
+# so EARLY_STOP_PATIENCE_CHECKS (real evaluation chances) is what should stay fixed
+# across display_every changes, not a raw patience step count.
 EARLY_STOP_PATIENCE_CHECKS = 10
 EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
 CHECKPOINT_PERIOD = 50
 
-# Per-model LR overrides (both default to LR above, i.e. no behavior change unless
-# explicitly passed). Added so the ntrain=2000/batch_size=20 divergence (U-WNO-MIONet
-# only -- Fourier-MIONet trained fine at the same shared LR/batch_size/data) can be
-# investigated by adjusting U-WNO-MIONet's LR alone, without touching Fourier-MIONet's
-# currently-working config. NOT defaulted to a different value here: the standard
-# linear/sqrt batch-size scaling rule would suggest RAISING lr for the 5x batch_size
-# increase, but that reasoning assumes batch_size grew while dataset size stayed fixed
-# (fewer, bigger steps per epoch to compensate for). Here ntrain scaled by the same 5x
-# as batch_size, so steps/epoch stayed at 100 in both the old (400/4) and new (2000/20)
-# configs -- the classic justification for scaling lr up doesn't apply. The observed
-# failure (train loss improving while test loss/R2 catastrophically worsens, and doing
-# so within ~1 epoch) looks like reduced per-step gradient noise (5x larger batch) letting
-# U-WNO-MIONet's much higher-capacity decoder converge fast into an overfit/sharp
-# solution -- which raising lr would likely worsen, not fix. Left unchanged by default
-# pending the verification run below; if you do want to experiment, try LOWERING
-# --wno-lr first, not raising it.
-FOURIER_LR = LR
-WNO_LR = LR
-
-
-def _build_model_specs(state_dir):
-    return [
-        {
-            "key": "fourier",
-            "name": "Fourier-MIONet",
-            "decoder_builder": _build_fourier_decoder,
-            "ckpt": os.path.join(state_dir, "sg_fourier_model.ckpt"),
-            "lr": FOURIER_LR,
-        },
-        {
-            "key": "wno",
-            "name": "U-WNO-MIONet",
-            "decoder_builder": _build_wavelet_decoder,
-            "ckpt": os.path.join(state_dir, "sg_wno_model.ckpt"),
-            "lr": WNO_LR,
-        },
-    ]
+MODEL_SPECS = [
+    {
+        "key": "fourier",
+        "name": "Fourier-MIONet",
+        "decoder_builder": _build_fourier_decoder,
+        "ckpt": "pre_train/dP_intermediate_fourier_model.ckpt",
+    },
+    {
+        "key": "wno",
+        "name": "U-WNO-MIONet",
+        "decoder_builder": _build_wavelet_decoder,
+        "ckpt": "pre_train/dP_intermediate_wno_model.ckpt",
+    },
+]
 
 
 def parse_args():
@@ -857,34 +862,12 @@ def parse_args():
         "--state-dir",
         type=str,
         default="pre_train",
-        help="Directory for checkpoints and resume-state files. IMPORTANT: pass a "
-        "different --state-dir for a verification/test run than whatever the live "
-        "scale-up job is using -- checkpoints (sg_{fourier,wno}_model.ckpt*) now live "
-        "under --state-dir too (previously hardcoded to pre_train/ regardless of "
-        "--state-dir), so this fully isolates a verification run's on-disk artifacts "
-        "from a concurrently-running job's.",
-    )
-    p.add_argument(
-        "--fourier-lr",
-        type=float,
-        default=FOURIER_LR,
-        help="Fourier-MIONet learning rate (default unchanged from the current 5e-4).",
-    )
-    p.add_argument(
-        "--wno-lr",
-        type=float,
-        default=WNO_LR,
-        help="U-WNO-MIONet learning rate (default unchanged from the current 5e-4 -- "
-        "override this alone to experiment with LR for the divergence investigation "
-        "without touching Fourier-MIONet).",
+        help="Directory for checkpoints and resume-state files.",
     )
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    # ============================================================
-    # Train U-WNO-MIONet and vanilla Fourier-MIONet under identical conditions
-    # ============================================================
     args = parse_args()
     NTRAIN, NTEST = args.ntrain, args.ntest
     BATCH_SIZE = args.batch_size
@@ -892,21 +875,15 @@ if __name__ == "__main__":
     ITERATIONS = args.iterations
     DISPLAY_EVERY = args.display_every
     EARLY_STOP_PATIENCE_CHECKS = args.early_stop_patience_checks
-    FOURIER_LR = args.fourier_lr
-    WNO_LR = args.wno_lr
-    # Both re-derived from the just-parsed args, not left at their module-level-default
-    # values -- these are exactly the two values that silently went stale in previous
-    # scale-ups if only ITERATIONS/DISPLAY_EVERY were overridden without recomputing them.
     DECAY_STEP = int(0.4 * ITERATIONS)
     EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
-    MODEL_SPECS = _build_model_specs(args.state_dir)
 
     print(
         f"[config] ntrain={NTRAIN} ntest={NTEST} batch_size={BATCH_SIZE} "
         f"timestep_batch_size={TIMESTEP_BATCH_SIZE} iterations={ITERATIONS} "
         f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} "
         f"early_stop_patience={EARLY_STOP_PATIENCE} ({EARLY_STOP_PATIENCE_CHECKS} real checks) "
-        f"fourier_lr={FOURIER_LR} wno_lr={WNO_LR} state_dir={args.state_dir}"
+        f"DP_WNO_LAYERS={DP_WNO_LAYERS} DP_WNO_WIDTH={DP_WNO_WIDTH}"
     )
 
     os.makedirs(args.state_dir, exist_ok=True)
@@ -922,28 +899,30 @@ if __name__ == "__main__":
     for spec in MODEL_SPECS:
         print(f"\n{'=' * 60}\nTraining {spec['name']}\n{'=' * 60}")
 
-        # Reset RNG before building the net so both models get identical branch1/branch2/
-        # trunk initial weights (only the decoder architecture differs), and reset again
-        # right before building Data so both see the exact same sequence of mini-batches
-        # (BatchSampler draws from the global np.random state).
         reset_seed(SEED)
         net = build_net(spec["decoder_builder"], output_transform)
+        n_params = sum(p.numel() for p in net.parameters())
+        extra = f" (DP_WNO_LAYERS={DP_WNO_LAYERS}, DP_WNO_WIDTH={DP_WNO_WIDTH})" if spec["key"] == "wno" else ""
+        print(f"[param count] {spec['name']}: {n_params:,} total params{extra}")
 
         reset_seed(SEED)
-        data = dde.data.Quadruple(x_train, y_train, x_test, y_test)
+        # Preserved from Fourier-UWNO-MIONet_dP.py: QuadrupleCartesianProd (not
+        # Quadruple) -- every training step sees the full 24 timesteps for its sampled
+        # branch batch, unlike sg's 8-of-24 timestep chunking.
+        data = dde.data.QuadrupleCartesianProd(x_train, y_train, x_test, y_test)
 
         model = dde.Model(data, net)
-        print(f"[config] {spec['name']}: lr={spec['lr']}")
         model.compile(
-            "adam",
-            lr=spec["lr"],
-            loss="mean l2 relative error",
+            "rmsprop",
+            loss=make_loss_fnc(data_bundle["grid_dx"], device),
+            loss_weights=[1, 0.5],
+            lr=LR,
             decay=("step", DECAY_STEP, DECAY_GAMMA),
             metrics=["mean l2 relative error", Rsquare_plume_tegother, MAE_plume],
         )
 
-        json_path = os.path.join(args.state_dir, f"sg_{spec['key']}_train_state.json")
-        weights_path = os.path.join(args.state_dir, f"sg_{spec['key']}_resume.pt")
+        json_path = os.path.join(args.state_dir, f"dP_intermediate_{spec['key']}_train_state.json")
+        weights_path = os.path.join(args.state_dir, f"dP_intermediate_{spec['key']}_resume.pt")
         resume_state = load_resume_state(json_path)
 
         if resume_state is not None and resume_state.get("complete"):
@@ -978,30 +957,19 @@ if __name__ == "__main__":
                     resume_best=resume_state["early_stopping"]["best"],
                     resume_stopped_epoch=resume_state["early_stopping"]["stopped_epoch"],
                 )
-                # .get(...) chain, not direct indexing: resume-state files written by a
-                # prior run of this script before the BestModelSaver test-loss fix won't
-                # have this key at all.
-                resume_best_saver = resume_state.get("best_saver", {}).get("best")
                 print(
                     f"{spec['name']}: resuming from step {resume_state['step']} "
                     f"({remaining_iterations} iterations remaining of {ITERATIONS} total)."
                 )
             else:
-                resume_best_saver = None
                 print(f"{spec['name']}: no resume state found at {json_path} -- starting fresh.")
 
             checker = dde.callbacks.ModelCheckpoint(
                 spec["ckpt"], save_better_only=True, period=CHECKPOINT_PERIOD, monitor="test loss"
             )
-            early_stopping = ResumableEarlyStopping(
-                min_delta=1e-4, patience=EARLY_STOP_PATIENCE, monitor="loss_test", **es_kwargs
-            )
-            best_saver = BestModelSaver(
-                f"{spec['ckpt']}-BEST.pt", monitor="test loss", resume_best=resume_best_saver
-            )
-            resume_ckpt = ResumeCheckpoint(
-                json_path, weights_path, early_stopping, best_saver, save_every=CHECKPOINT_PERIOD
-            )
+            early_stopping = ResumableEarlyStopping(min_delta=1e-4, patience=EARLY_STOP_PATIENCE, **es_kwargs)
+            best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
+            resume_ckpt = ResumeCheckpoint(json_path, weights_path, early_stopping, save_every=CHECKPOINT_PERIOD)
             timing_probe = EarlyTimingProbe(spec["name"], probe_steps=20)
 
             print(f"Training {spec['name']}...")
@@ -1012,6 +980,7 @@ if __name__ == "__main__":
                 timestep_batch_size=TIMESTEP_BATCH_SIZE,
                 training_time_size=TRAINING_TIME_SIZE,
                 display_every=DISPLAY_EVERY,
+                init_test=True,
                 callbacks=[checker, early_stopping, best_saver, resume_ckpt, timing_probe],
             )
             elapsed = time.time() - start_time
@@ -1025,15 +994,8 @@ if __name__ == "__main__":
         best_path = f"{spec['ckpt']}-BEST.pt"
         if os.path.exists(best_path):
             model.restore(best_path, verbose=1)
-            print(
-                f"Restored test-loss-best weights for {spec['name']} "
-                f"(note: this is best_saver's own best-test-loss step, which can differ "
-                f"from train_state.best_step={train_state.best_step} -- see BestModelSaver)."
-            )
+            print(f"Restored guaranteed-best weights for {spec['name']} (best_step={train_state.best_step}).")
         else:
-            # Should only happen if training was interrupted before the first
-            # display_every checkpoint — fall back to the periodic (train-loss-monitored)
-            # snapshot, which may not match best_saver's test-loss-best step at all.
             periodic_path = f"{spec['ckpt']}-{train_state.best_step}.pt"
             try:
                 model.restore(periodic_path, verbose=1)
@@ -1097,7 +1059,7 @@ if __name__ == "__main__":
     ]
 
     print(f"\n{'=' * 100}")
-    print(f"Per-checkpoint comparison: Fourier-MIONet vs U-WNO-MIONet")
+    print(f"Per-checkpoint comparison: Fourier-MIONet vs U-WNO-MIONet (pressure buildup, intermediate scale)")
     print(f"{'=' * 100}")
 
     rows = []
@@ -1131,12 +1093,12 @@ if __name__ == "__main__":
             f"| U-WNO-MIONet R2={w_r2} MAE={w_mae} | delta R2={d_r2}"
         )
 
-    with open("comparison_log.csv", "w", newline="") as f:
+    with open("comparison_log_dp_intermediate.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
 
-    print("\nSaved per-checkpoint comparison to comparison_log.csv")
+    print("\nSaved per-checkpoint comparison to comparison_log_dp_intermediate.csv")
 
     # ============================================================
     # Final summary

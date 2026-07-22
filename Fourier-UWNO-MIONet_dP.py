@@ -353,10 +353,17 @@ class U_net(nn.Module):
 
 
 class WaveletDecoder(nn.Module):
-    def __init__(self, width, level, size, wavelet, layers=4, width2=128):
+    def __init__(self, width, level, size, wavelet, layers=4, width2=128, input_width=None):
         super().__init__()
         self.layers = layers
         self.width = width
+        # input_width is the branch/trunk merge output's fixed channel count (36, see
+        # DP_WNO_WIDTH below). When it differs from this decoder's internal `width`, a
+        # 1x1-conv projection is needed at the very entry point, since every WaveConv2d/
+        # U_net block below operates at `width` channels internally.
+        self.input_proj = (
+            nn.Conv2d(input_width, width, 1) if input_width is not None and input_width != width else None
+        )
         self.a = nn.Parameter(torch.FloatTensor([0.1]))
         self.conv = nn.ModuleList(
             [WaveConv2d(width, width, level, size, wavelet, mode="zero") for _ in range(layers)]
@@ -375,6 +382,9 @@ class WaveletDecoder(nn.Module):
 
         if x.shape[0] == 0:
             return torch.zeros(0, 96, 200, device=x.device, dtype=x.dtype)
+
+        if self.input_proj is not None:
+            x = self.input_proj(x)
 
         batchsize = x.shape[0]
         size_x, size_y = x.shape[2], x.shape[3]
@@ -473,20 +483,30 @@ class WrappedTrunk(nn.Module):
 
 # dP is a smoother, more diffuse field than sg's sharp CO2 plume fronts, and this decoder
 # dominates the model's parameter count almost entirely (WaveConv2d's wavelet-domain
-# weights scale with the padded [104, 208] grid and level, not with the FC head) -- see
-# DP_WNO_LAYERS below. width=36 is NOT a free parameter here: it's the branch/trunk merge
-# output width shared with Fourier-MIONet's decoder too (see build_net's layer_sizes_*),
-# so changing it would require adding a projection layer into the decoder, confounding a
-# capacity change with an architecture change. layers is the one cleanly isolated capacity
-# knob available without touching branch/trunk/merge.
-DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "4"))
+# weights scale with the padded [104, 208] grid and level, quadratically with channel
+# width, and with the level) -- see DP_WNO_LAYERS/DP_WNO_WIDTH below. The branch/trunk
+# merge output is fixed at 36 channels (see build_net's layer_sizes_*), so decoding at a
+# narrower internal width now goes through a 1x1-conv input_proj (WaveletDecoder's
+# input_width arg) rather than requiring merge/branch/trunk changes. layers=1 is the
+# new best-known config (A/B: 4->2 layers fixed catastrophic overfitting, 2->1 showed no
+# further change) -- carried forward here as the new default. width is the other
+# capacity knob, tested once alongside layers=1 below.
+DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "1"))
+DP_WNO_WIDTH = int(os.environ.get("DP_WNO_WIDTH", "36"))
+_MERGE_WIDTH = 36  # fixed by branch/trunk output channels; not a free parameter
 
 
 def _build_wavelet_decoder():
     dec = WaveletDecoder(
-        width=36, level=4, size=[104, 208], wavelet="db6", layers=DP_WNO_LAYERS, width2=128
+        width=DP_WNO_WIDTH,
+        level=4,
+        size=[104, 208],
+        wavelet="db6",
+        layers=DP_WNO_LAYERS,
+        width2=128,
+        input_width=_MERGE_WIDTH,
     )
-    dec.set_unet(nn.ModuleList([U_net(36, 36, 3, 0.0) for _ in range(DP_WNO_LAYERS)]))
+    dec.set_unet(nn.ModuleList([U_net(DP_WNO_WIDTH, DP_WNO_WIDTH, 3, 0.0) for _ in range(DP_WNO_LAYERS)]))
     return dec
 
 
@@ -744,7 +764,7 @@ if __name__ == "__main__":
         reset_seed(SEED)
         net = build_net(spec["decoder_builder"], output_transform)
         n_params = sum(p.numel() for p in net.parameters())
-        extra = f" (DP_WNO_LAYERS={DP_WNO_LAYERS})" if spec["key"] == "wno" else ""
+        extra = f" (DP_WNO_LAYERS={DP_WNO_LAYERS}, DP_WNO_WIDTH={DP_WNO_WIDTH})" if spec["key"] == "wno" else ""
         print(f"[param count] {spec['name']}: {n_params:,} total params{extra}")
 
         reset_seed(SEED)
