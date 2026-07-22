@@ -1,7 +1,9 @@
 import os
 os.environ["DDE_BACKEND"] = "pytorch"
 
+import argparse
 import csv
+import json
 import random
 import time
 import warnings
@@ -448,10 +450,170 @@ class BestModelSaver(dde.callbacks.Callback):
             self._last_saved_step = ts.best_step
 
 
+class ResumableEarlyStopping(dde.callbacks.EarlyStopping):
+    """Identical to dde.callbacks.EarlyStopping, except on_train_begin only resets
+    wait/best/stopped_epoch to their fresh-start defaults when no resumed values were
+    supplied at construction time. Model.train() calls on_train_begin() unconditionally
+    at the start of every .train() call -- including a resumed one -- so without this
+    override, resuming would silently wipe the exact counters we're trying to resume."""
+
+    def __init__(self, *args, resume_wait=None, resume_best=None, resume_stopped_epoch=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resume_wait = resume_wait
+        self._resume_best = resume_best
+        self._resume_stopped_epoch = resume_stopped_epoch
+
+    def on_train_begin(self):
+        super().on_train_begin()
+        if self._resume_wait is not None:
+            self.wait = self._resume_wait
+        if self._resume_best is not None:
+            self.best = self._resume_best
+        if self._resume_stopped_epoch is not None:
+            self.stopped_epoch = self._resume_stopped_epoch
+
+
+class ResumeCheckpoint(dde.callbacks.Callback):
+    """Periodically persists everything needed to resume training after a Slurm
+    preemption/timeout on the 48-hour partition -- not just net/optimizer weights
+    (which Model.save()/restore() and BestModelSaver already handle), but also:
+
+    - The LR scheduler's own state. `decay=("step", ...)` builds a separate
+      torch.optim.lr_scheduler.StepLR object (model.lr_scheduler) with its own
+      internal step counter (last_epoch) -- Model.save()/restore() does NOT capture
+      it, so naively restoring only net+optimizer would reset the decay schedule to
+      start over from step 0, decoupling it from the actual resumed step.
+    - TrainState bookkeeping (step, best_step, best_loss_train/test) so the resumed
+      run knows how many iterations remain and doesn't reset "best so far".
+    - EarlyStopping's wait/best/stopped_epoch counters (see ResumableEarlyStopping).
+    - The LossHistory accumulated so far (steps/loss_train/loss_test/metrics_test) --
+      a resumed run gets a brand new dde.Model with an empty LossHistory, so without
+      this, the final per-checkpoint comparison CSV would silently lose every row
+      from before the resume point.
+
+    Two files, written together so they can't desync: a .pt for tensors (weights,
+    optimizer, scheduler) and a .json for everything JSON-serializable. `complete`
+    marks whether this model's training has fully finished (iterations exhausted or
+    EarlyStopping fired) -- checked on startup to skip re-training a finished model.
+    """
+
+    def __init__(self, json_path, weights_path, early_stopping, save_every=50):
+        super().__init__()
+        self.json_path = json_path
+        self.weights_path = weights_path
+        self.early_stopping = early_stopping
+        self.save_every = save_every
+
+    def _save(self, complete):
+        m = self.model
+        ts = m.train_state
+        torch.save(
+            {
+                "model_state_dict": m.net.state_dict(),
+                "optimizer_state_dict": m.opt.state_dict(),
+                "lr_scheduler_state_dict": (
+                    m.lr_scheduler.state_dict() if m.lr_scheduler is not None else None
+                ),
+            },
+            self.weights_path,
+        )
+        state = {
+            "complete": complete,
+            "step": ts.step,
+            "best_step": ts.best_step,
+            "best_loss_train": float(np.sum(ts.best_loss_train)),
+            "best_loss_test": float(np.sum(ts.best_loss_test)),
+            "early_stopping": {
+                "wait": self.early_stopping.wait,
+                "best": float(self.early_stopping.best),
+                "stopped_epoch": self.early_stopping.stopped_epoch,
+            },
+            "losshistory": {
+                "steps": list(m.losshistory.steps),
+                "loss_train": [[float(v) for v in np.atleast_1d(x)] for x in m.losshistory.loss_train],
+                "loss_test": [[float(v) for v in np.atleast_1d(x)] for x in m.losshistory.loss_test],
+                "metrics_test": [[float(v) for v in np.atleast_1d(x)] for x in m.losshistory.metrics_test],
+            },
+        }
+        tmp_path = self.json_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, self.json_path)
+
+    def on_epoch_end(self):
+        if self.model.train_state.step % self.save_every == 0:
+            self._save(complete=False)
+
+    def on_train_end(self):
+        self._save(complete=True)
+
+
+def load_resume_state(json_path):
+    """Returns None if no resume state file exists yet (fresh start)."""
+    if not os.path.exists(json_path):
+        return None
+    with open(json_path) as f:
+        return json.load(f)
+
+
+def apply_resumed_history(model, resume_state):
+    """Splice a previously-persisted LossHistory back into a freshly constructed
+    dde.Model so the final comparison CSV includes pre-resume rows too."""
+    lh = resume_state["losshistory"]
+    model.losshistory.steps = list(lh["steps"])
+    model.losshistory.loss_train = list(lh["loss_train"])
+    model.losshistory.loss_test = list(lh["loss_test"])
+    model.losshistory.metrics_test = list(lh["metrics_test"])
+
+
+class EarlyTimingProbe(dde.callbacks.Callback):
+    """Prints a measured (not assumed/extrapolated) average seconds/step after the
+    first `probe_steps` real steps of THIS invocation -- so a short verification run
+    (e.g. --iterations 30) reports true per-step timing at the new batch_size before
+    committing GPU time to the full run, and a resumed run measures fresh rather than
+    reusing a stale pre-resume number."""
+
+    def __init__(self, label, probe_steps=20):
+        super().__init__()
+        self.label = label
+        self.probe_steps = probe_steps
+        self._probe_start_step = None
+        self._start_time = None
+        self._done = False
+
+    def on_train_begin(self):
+        self._probe_start_step = self.model.train_state.step
+        self._start_time = time.time()
+
+    def on_epoch_end(self):
+        if self._done:
+            return
+        steps_done = self.model.train_state.step - self._probe_start_step
+        if steps_done >= self.probe_steps:
+            elapsed = time.time() - self._start_time
+            print(
+                f"[timing] {self.label}: {elapsed / steps_done:.4f} s/step measured over "
+                f"{steps_done} real steps (batch_size={BATCH_SIZE}).",
+                flush=True,
+            )
+            self._done = True
+
+
 # ============================================================
 # Load + normalize data (fall back to a smaller size if RAM/VRAM can't hold it)
 # ============================================================
-DATASET_CANDIDATES = [(400, 80), (200, 40)]
+# NTRAIN/NTEST are module-level (not local to `if __name__ == "__main__"`) because
+# generate_predictions_and_plots.py imports this file via importlib (its __name__ is
+# never "__main__", so the CLI-parsing block below never runs) and calls
+# load_and_normalize_data() directly for inference -- it needs these to already hold
+# whatever size the checkpoint was actually trained with. CLI args (see __main__)
+# override these two names directly, at module scope, before training starts. If you
+# override --ntrain/--ntest for a one-off run, re-running generate_predictions_and_plots.py
+# afterward will still use these defaults (2000/222), not your override -- pass the same
+# override there too, or the field/output normalizers will be refit on a mismatched split.
+NTRAIN, NTEST = 2000, 222
+# Historical smaller sizes, tried in order if a larger size hits a MemoryError.
+DATASET_FALLBACKS = [(400, 80), (200, 40)]
 
 
 def load_and_normalize_data():
@@ -461,7 +623,10 @@ def load_and_normalize_data():
     below actually trains anything."""
     x_train = y_train = x_test = y_test = grid_x = None
     ntrain = ntest = None
-    for cand_ntrain, cand_ntest in DATASET_CANDIDATES:
+    dataset_candidates = [(NTRAIN, NTEST)] + [
+        c for c in DATASET_FALLBACKS if c != (NTRAIN, NTEST)
+    ]
+    for cand_ntrain, cand_ntest in dataset_candidates:
         try:
             x_train, y_train, x_test, y_test, grid_x = get_data(cand_ntrain, cand_ntest)
             ntrain, ntest = cand_ntrain, cand_ntest
@@ -567,17 +732,43 @@ def predict_in_chunks(model, x_test, branch_chunk=4, time_chunk=8, training_time
     return np.concatenate(branch_chunks, axis=0).reshape(n, -1)
 
 
-ITERATIONS = 1200
-BATCH_SIZE = 4
-TIMESTEP_BATCH_SIZE = 8
+# Scaled-up run (per 2026-07-21 professor/PhD-student meeting guidance): ntrain=2000
+# (~44% of the paper's 4500), iterations=7500 (75 epochs at 100 batches/epoch = 50% of
+# the paper's 150-epoch schedule, the midpoint of the requested 40-60% range). All of
+# these are plain module-level globals (not local to `if __name__ == "__main__"`) for
+# the same reason NTRAIN/NTEST are above: generate_predictions_and_plots.py imports this
+# file without running the CLI block, and reads BATCH_SIZE/TIMESTEP_BATCH_SIZE directly.
+# CLI args in __main__ reassign these names in place before training starts.
+ITERATIONS = 7500
+BATCH_SIZE = 20  # ntrain/batch_size = 2000/20 = 100 batches/epoch
+TIMESTEP_BATCH_SIZE = 8  # unchanged -- paper's own tested accuracy/memory sweet spot
 TRAINING_TIME_SIZE = 24
-DISPLAY_EVERY = 10
+DISPLAY_EVERY = 100  # 7500/100 = 75 printed rows, in the requested 50-100 range
 LR = 5e-4
 # Un-normalized inputs likely made the model bounce around a wide loss basin at the
 # original 1e-3 LR; now that inputs are normalized, drop LR and decay it partway
-# through training instead of holding it constant.
+# through training instead of holding it constant. Already a function of ITERATIONS,
+# not a hardcoded step count, so it scales automatically with the new budget (verified:
+# 0.4 * 7500 = 3000, still comfortably inside the run, same 40%-through-training point
+# as the previous 1200-iteration config's 480).
 DECAY_STEP = int(0.4 * ITERATIONS)
 DECAY_GAMMA = 0.5
+
+# EarlyStopping's `patience` counts on_epoch_end() CALLS, which happen every single
+# training step -- not every display_every steps. But the monitored quantity
+# (train_state.loss_train) only actually CHANGES value at display_every cadence (that's
+# when Model._test() runs); in between, on_epoch_end() re-checks the same frozen value
+# against `best`, which reads as "no improvement" and increments `wait` on every one of
+# those steps too. So patience, in effect, buys you (patience / display_every) real
+# evaluation chances before firing -- not `patience` chances. The previous 1200-iteration
+# config (display_every=10, patience=100) had 10 real chances (~8% of its 120 total
+# checks). Scaling display_every to 100 for this run without also scaling patience would
+# silently collapse that to 1 real chance (100/100) -- EarlyStopping would fire after a
+# single non-improving evaluation, likely almost immediately. EARLY_STOP_PATIENCE_CHECKS
+# preserves the original 10-real-chances tolerance regardless of display_every.
+EARLY_STOP_PATIENCE_CHECKS = 10
+EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
+CHECKPOINT_PERIOD = 50
 
 MODEL_SPECS = [
     {
@@ -595,11 +786,55 @@ MODEL_SPECS = [
 ]
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--ntrain", type=int, default=NTRAIN)
+    p.add_argument("--ntest", type=int, default=NTEST)
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    p.add_argument("--timestep-batch-size", type=int, default=TIMESTEP_BATCH_SIZE)
+    p.add_argument("--iterations", type=int, default=ITERATIONS)
+    p.add_argument("--display-every", type=int, default=DISPLAY_EVERY)
+    p.add_argument(
+        "--early-stop-patience-checks",
+        type=int,
+        default=EARLY_STOP_PATIENCE_CHECKS,
+        help="EarlyStopping tolerance in units of real (display_every-spaced) evaluations, "
+        "not raw steps -- see the comment above EARLY_STOP_PATIENCE_CHECKS for why.",
+    )
+    p.add_argument(
+        "--state-dir",
+        type=str,
+        default="pre_train",
+        help="Directory for checkpoints and resume-state files.",
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
     # ============================================================
     # Train U-WNO-MIONet and vanilla Fourier-MIONet under identical conditions
     # ============================================================
-    os.makedirs("./pre_train", exist_ok=True)
+    args = parse_args()
+    NTRAIN, NTEST = args.ntrain, args.ntest
+    BATCH_SIZE = args.batch_size
+    TIMESTEP_BATCH_SIZE = args.timestep_batch_size
+    ITERATIONS = args.iterations
+    DISPLAY_EVERY = args.display_every
+    EARLY_STOP_PATIENCE_CHECKS = args.early_stop_patience_checks
+    # Both re-derived from the just-parsed args, not left at their module-level-default
+    # values -- these are exactly the two values that silently went stale in previous
+    # scale-ups if only ITERATIONS/DISPLAY_EVERY were overridden without recomputing them.
+    DECAY_STEP = int(0.4 * ITERATIONS)
+    EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
+
+    print(
+        f"[config] ntrain={NTRAIN} ntest={NTEST} batch_size={BATCH_SIZE} "
+        f"timestep_batch_size={TIMESTEP_BATCH_SIZE} iterations={ITERATIONS} "
+        f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} "
+        f"early_stop_patience={EARLY_STOP_PATIENCE} ({EARLY_STOP_PATIENCE_CHECKS} real checks)"
+    )
+
+    os.makedirs(args.state_dir, exist_ok=True)
     os.makedirs("./model", exist_ok=True)
 
     data_bundle = load_and_normalize_data()
@@ -631,21 +866,66 @@ if __name__ == "__main__":
             metrics=["mean l2 relative error", Rsquare_plume_tegother, MAE_plume],
         )
 
-        checker = dde.callbacks.ModelCheckpoint(spec["ckpt"], save_better_only=True, period=50)
-        early_stopping = dde.callbacks.EarlyStopping(min_delta=1e-4, patience=100)
-        best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
+        json_path = os.path.join(args.state_dir, f"sg_{spec['key']}_train_state.json")
+        weights_path = os.path.join(args.state_dir, f"sg_{spec['key']}_resume.pt")
+        resume_state = load_resume_state(json_path)
 
-        print(f"Training {spec['name']}...")
-        start_time = time.time()
-        losshistory, train_state = model.train(
-            iterations=ITERATIONS,
-            batch_size=BATCH_SIZE,
-            timestep_batch_size=TIMESTEP_BATCH_SIZE,
-            training_time_size=TRAINING_TIME_SIZE,
-            display_every=DISPLAY_EVERY,
-            callbacks=[checker, early_stopping, best_saver],
-        )
-        elapsed = time.time() - start_time
+        if resume_state is not None and resume_state.get("complete"):
+            print(
+                f"{spec['name']}: resume state at {json_path} is marked complete "
+                f"(step={resume_state['step']}) -- skipping training, restoring saved history only."
+            )
+            model.train_state.step = resume_state["step"]
+            model.train_state.best_step = resume_state["best_step"]
+            model.train_state.best_loss_train = resume_state["best_loss_train"]
+            model.train_state.best_loss_test = resume_state["best_loss_test"]
+            apply_resumed_history(model, resume_state)
+            losshistory, train_state = model.losshistory, model.train_state
+            elapsed = 0.0
+        else:
+            remaining_iterations = ITERATIONS
+            es_kwargs = {}
+            if resume_state is not None:
+                ckpt = torch.load(weights_path, map_location=device)
+                model.net.load_state_dict(ckpt["model_state_dict"])
+                model.opt.load_state_dict(ckpt["optimizer_state_dict"])
+                if ckpt.get("lr_scheduler_state_dict") is not None and model.lr_scheduler is not None:
+                    model.lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
+                model.train_state.step = resume_state["step"]
+                model.train_state.best_step = resume_state["best_step"]
+                model.train_state.best_loss_train = resume_state["best_loss_train"]
+                model.train_state.best_loss_test = resume_state["best_loss_test"]
+                apply_resumed_history(model, resume_state)
+                remaining_iterations = max(0, ITERATIONS - resume_state["step"])
+                es_kwargs = dict(
+                    resume_wait=resume_state["early_stopping"]["wait"],
+                    resume_best=resume_state["early_stopping"]["best"],
+                    resume_stopped_epoch=resume_state["early_stopping"]["stopped_epoch"],
+                )
+                print(
+                    f"{spec['name']}: resuming from step {resume_state['step']} "
+                    f"({remaining_iterations} iterations remaining of {ITERATIONS} total)."
+                )
+            else:
+                print(f"{spec['name']}: no resume state found at {json_path} -- starting fresh.")
+
+            checker = dde.callbacks.ModelCheckpoint(spec["ckpt"], save_better_only=True, period=CHECKPOINT_PERIOD)
+            early_stopping = ResumableEarlyStopping(min_delta=1e-4, patience=EARLY_STOP_PATIENCE, **es_kwargs)
+            best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
+            resume_ckpt = ResumeCheckpoint(json_path, weights_path, early_stopping, save_every=CHECKPOINT_PERIOD)
+            timing_probe = EarlyTimingProbe(spec["name"], probe_steps=20)
+
+            print(f"Training {spec['name']}...")
+            start_time = time.time()
+            losshistory, train_state = model.train(
+                iterations=remaining_iterations,
+                batch_size=BATCH_SIZE,
+                timestep_batch_size=TIMESTEP_BATCH_SIZE,
+                training_time_size=TRAINING_TIME_SIZE,
+                display_every=DISPLAY_EVERY,
+                callbacks=[checker, early_stopping, best_saver, resume_ckpt, timing_probe],
+            )
+            elapsed = time.time() - start_time
         steps_run = max(train_state.step, 1)
 
         print(f"{spec['name']} best step:", train_state.best_step)
