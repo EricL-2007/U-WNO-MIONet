@@ -628,6 +628,76 @@ class EarlyTimingProbe(dde.callbacks.Callback):
             self._done = True
 
 
+class DivergenceGuard(dde.callbacks.Callback):
+    """Fast-acting safety net for catastrophic collapse, independent of (and much
+    quicker than) the normal patience-until-improvement mechanisms above.
+
+    dde.callbacks.EarlyStopping/ResumableEarlyStopping only fire after `patience`
+    consecutive non-improving steps -- even the tightened WNO_PATIENCE_CHECKS=4 (400
+    raw steps, see above) still requires 4 full epochs of no improvement. That's the
+    right tolerance for an ordinary plateau, but both confirmed U-WNO-MIONet divergence
+    episodes collapsed from healthy/moderate to catastrophic (R2 -24 to -32) within a
+    few hundred steps -- this exists to catch THAT specific severity fast, as a safety
+    net layered on top of normal patience, not a replacement for it.
+
+    Only counts REAL evaluations (aligned to `display_every`), not raw on_epoch_end()
+    calls -- unlike EarlyStopping's `patience`, which double-counts the same frozen
+    metric value on every step between evaluations (see the EARLY_STOP_PATIENCE_CHECKS
+    comment above). That quirk is a deliberate, well-understood tradeoff for ordinary
+    patience; a safety net for catastrophic collapse shouldn't inherit it, since it
+    would make "consecutive checks" fire off a single bad evaluation repeated across
+    many raw steps rather than genuinely-repeated bad evaluations.
+
+    Disabled entirely when `threshold` is None (see --disable-wno-divergence-guard).
+    Not resumability-aware by design: `_consecutive_bad` resets to 0 on every fresh
+    `.train()` call (including a resumed one), which just means a resumed run needs
+    `consecutive_checks` bad evaluations of its own before firing -- an acceptable,
+    deliberately simple tradeoff for a 2-4-check safety net (unlike EarlyStopping's
+    wait/best, which really does need to survive a resume to keep its intended
+    hundreds-of-steps tolerance meaningful).
+    """
+
+    def __init__(self, label, display_every, metric_index=1, threshold=-10.0, consecutive_checks=2):
+        super().__init__()
+        self.label = label
+        self.display_every = display_every
+        self.metric_index = metric_index
+        self.threshold = threshold
+        self.consecutive_checks = consecutive_checks
+        self._consecutive_bad = 0
+        self._last_checked_step = None
+
+    def on_epoch_end(self):
+        if self.threshold is None:
+            return
+        ts = self.model.train_state
+        if ts.step == self._last_checked_step or ts.step % self.display_every != 0:
+            return
+        self._last_checked_step = ts.step
+        if ts.metrics_test is None or len(ts.metrics_test) <= self.metric_index:
+            return
+
+        value = float(ts.metrics_test[self.metric_index])
+        if value < self.threshold:
+            self._consecutive_bad += 1
+            print(
+                f"[divergence-guard] {self.label}: metric={value:.4f} < threshold={self.threshold} "
+                f"({self._consecutive_bad}/{self.consecutive_checks} consecutive bad checks) "
+                f"at step {ts.step}",
+                flush=True,
+            )
+            if self._consecutive_bad >= self.consecutive_checks:
+                print(
+                    f"[divergence-guard] {self.label}: stopping immediately -- "
+                    f"{self.consecutive_checks} consecutive real evaluations below "
+                    f"threshold={self.threshold}.",
+                    flush=True,
+                )
+                self.model.stop_training = True
+        else:
+            self._consecutive_bad = 0
+
+
 # ============================================================
 # Load + normalize data (fall back to a smaller size if RAM/VRAM can't hold it)
 # ============================================================
@@ -795,9 +865,44 @@ DECAY_GAMMA = 0.5
 # silently collapse that to 1 real chance (100/100) -- EarlyStopping would fire after a
 # single non-improving evaluation, likely almost immediately. EARLY_STOP_PATIENCE_CHECKS
 # preserves the original 10-real-chances tolerance regardless of display_every.
+#
+# EARLY_STOP_PATIENCE_CHECKS below is now Fourier-MIONet-only (see WNO_PATIENCE_CHECKS):
+# Fourier-MIONet has been stable across both sg divergence episodes and doesn't need a
+# tighter window, so its patience is left unchanged.
 EARLY_STOP_PATIENCE_CHECKS = 10
 EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
-CHECKPOINT_PERIOD = 50
+
+# U-WNO-MIONet-specific, tighter patience. The 10-checks/1000-step window above let two
+# confirmed divergence episodes collapse from healthy/moderate to catastrophic (R2 -24 to
+# -32) well before EarlyStopping could fire -- both times the collapse was visible within
+# a few hundred steps, far inside the 1000-step tolerance. 4 checks (400 raw steps = 4
+# epochs at 100 steps/epoch) still requires multiple consecutive non-improving real
+# evaluations (guards against single noisy fluctuations) but cuts the worst-case damage
+# window by 60% versus Fourier-MIONet's unchanged 10-check patience. CLI-overridable via
+# --wno-patience-checks.
+WNO_PATIENCE_CHECKS = 4
+
+# Fast-acting safety net independent of the patience-until-improvement mechanisms above:
+# if test R2 collapses below this threshold for WNO_DIVERGENCE_CHECKS consecutive real
+# evaluations, stop immediately regardless of the normal patience counter (see
+# DivergenceGuard below). -10.0 is well below anything seen in a healthy run (a
+# reasonably-fit model scores R2 close to 1; even a mediocre-but-not-diverging fit
+# shouldn't approach -10) but comfortably above the -24/-32 actually observed, so it
+# fires well before the worst of either confirmed episode. CLI-overridable
+# (--wno-divergence-r2-threshold, --wno-divergence-checks); set
+# --disable-wno-divergence-guard to turn it off entirely.
+WNO_DIVERGENCE_R2_THRESHOLD = -10.0
+WNO_DIVERGENCE_CHECKS = 2
+
+# Governs both the full weights+optimizer+scheduler .pt snapshot AND how often
+# EarlyStopping's wait/best counters get persisted (see ResumeCheckpoint) -- the two are
+# saved together so they can't desync. Lowered from 50 (previously up to 49 raw steps of
+# staleness in a resumed wait/best -- small relative to the old 1000-step patience, but a
+# larger fraction of WNO's new 400-step patience above). 20 cuts worst-case staleness to
+# 19 steps at a modest ~2.5x increase in checkpoint IO frequency over a 7500-iteration
+# run -- cheap relative to compute time on an A100, and still far short of the per-step
+# cost of doing this on every single step.
+CHECKPOINT_PERIOD = 20
 
 # Per-model LR overrides (both default to LR above, i.e. no behavior change unless
 # explicitly passed). Added so the ntrain=2000/batch_size=20 divergence (U-WNO-MIONet
@@ -819,7 +924,7 @@ FOURIER_LR = LR
 WNO_LR = LR
 
 
-def _build_model_specs(state_dir):
+def _build_model_specs(state_dir, wno_patience_checks, wno_divergence_threshold, wno_divergence_checks):
     return [
         {
             "key": "fourier",
@@ -827,6 +932,9 @@ def _build_model_specs(state_dir):
             "decoder_builder": _build_fourier_decoder,
             "ckpt": os.path.join(state_dir, "sg_fourier_model.ckpt"),
             "lr": FOURIER_LR,
+            "patience_checks": EARLY_STOP_PATIENCE_CHECKS,
+            "divergence_threshold": None,  # guard is WNO-only, see FIX 1 above
+            "divergence_checks": None,
         },
         {
             "key": "wno",
@@ -834,6 +942,9 @@ def _build_model_specs(state_dir):
             "decoder_builder": _build_wavelet_decoder,
             "ckpt": os.path.join(state_dir, "sg_wno_model.ckpt"),
             "lr": WNO_LR,
+            "patience_checks": wno_patience_checks,
+            "divergence_threshold": wno_divergence_threshold,
+            "divergence_checks": wno_divergence_checks,
         },
     ]
 
@@ -878,6 +989,39 @@ def parse_args():
         "override this alone to experiment with LR for the divergence investigation "
         "without touching Fourier-MIONet).",
     )
+    p.add_argument(
+        "--wno-patience-checks",
+        type=int,
+        default=WNO_PATIENCE_CHECKS,
+        help="U-WNO-MIONet-only EarlyStopping tolerance in units of real evaluations "
+        "(same units as --early-stop-patience-checks, which stays Fourier-MIONet-only). "
+        "Default 4 (400 raw steps at display_every=100) -- tighter than Fourier-MIONet's "
+        "10, since two confirmed divergence episodes showed U-WNO-MIONet can collapse to "
+        "catastrophic R2 well within 1000 steps.",
+    )
+    p.add_argument(
+        "--wno-divergence-r2-threshold",
+        type=float,
+        default=WNO_DIVERGENCE_R2_THRESHOLD,
+        help="U-WNO-MIONet-only fast divergence guard: stop immediately if test R2 stays "
+        "below this threshold for --wno-divergence-checks consecutive real evaluations, "
+        "regardless of the normal patience counter. Default -10.0 (well below any healthy "
+        "run, comfortably above the -24/-32 actually observed). See --disable-wno-"
+        "divergence-guard to turn this off.",
+    )
+    p.add_argument(
+        "--wno-divergence-checks",
+        type=int,
+        default=WNO_DIVERGENCE_CHECKS,
+        help="Number of consecutive real evaluations below --wno-divergence-r2-threshold "
+        "required to trigger the fast divergence guard. Default 2.",
+    )
+    p.add_argument(
+        "--disable-wno-divergence-guard",
+        action="store_true",
+        help="Turn off the fast divergence guard entirely (normal EarlyStopping patience "
+        "-- --wno-patience-checks -- still applies).",
+    )
     return p.parse_args()
 
 
@@ -894,19 +1038,29 @@ if __name__ == "__main__":
     EARLY_STOP_PATIENCE_CHECKS = args.early_stop_patience_checks
     FOURIER_LR = args.fourier_lr
     WNO_LR = args.wno_lr
+    WNO_PATIENCE_CHECKS = args.wno_patience_checks
+    WNO_DIVERGENCE_R2_THRESHOLD = None if args.disable_wno_divergence_guard else args.wno_divergence_r2_threshold
+    WNO_DIVERGENCE_CHECKS = args.wno_divergence_checks
     # Both re-derived from the just-parsed args, not left at their module-level-default
     # values -- these are exactly the two values that silently went stale in previous
     # scale-ups if only ITERATIONS/DISPLAY_EVERY were overridden without recomputing them.
     DECAY_STEP = int(0.4 * ITERATIONS)
     EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
-    MODEL_SPECS = _build_model_specs(args.state_dir)
+    WNO_PATIENCE = WNO_PATIENCE_CHECKS * DISPLAY_EVERY
+    MODEL_SPECS = _build_model_specs(
+        args.state_dir, WNO_PATIENCE_CHECKS, WNO_DIVERGENCE_R2_THRESHOLD, WNO_DIVERGENCE_CHECKS
+    )
 
     print(
         f"[config] ntrain={NTRAIN} ntest={NTEST} batch_size={BATCH_SIZE} "
         f"timestep_batch_size={TIMESTEP_BATCH_SIZE} iterations={ITERATIONS} "
         f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} "
-        f"early_stop_patience={EARLY_STOP_PATIENCE} ({EARLY_STOP_PATIENCE_CHECKS} real checks) "
-        f"fourier_lr={FOURIER_LR} wno_lr={WNO_LR} state_dir={args.state_dir}"
+        f"fourier_lr={FOURIER_LR} fourier_patience={EARLY_STOP_PATIENCE} "
+        f"({EARLY_STOP_PATIENCE_CHECKS} real checks) "
+        f"wno_lr={WNO_LR} wno_patience={WNO_PATIENCE} ({WNO_PATIENCE_CHECKS} real checks) "
+        f"wno_divergence_guard="
+        f"{'disabled' if WNO_DIVERGENCE_R2_THRESHOLD is None else f'R2<{WNO_DIVERGENCE_R2_THRESHOLD} x{WNO_DIVERGENCE_CHECKS}'} "
+        f"checkpoint_period={CHECKPOINT_PERIOD} state_dir={args.state_dir}"
     )
 
     os.makedirs(args.state_dir, exist_ok=True)
@@ -993,8 +1147,11 @@ if __name__ == "__main__":
             checker = dde.callbacks.ModelCheckpoint(
                 spec["ckpt"], save_better_only=True, period=CHECKPOINT_PERIOD, monitor="test loss"
             )
+            # Per-spec patience: Fourier-MIONet keeps EARLY_STOP_PATIENCE_CHECKS (10, unchanged);
+            # U-WNO-MIONet uses its own, tighter spec["patience_checks"] (default 4).
+            spec_patience = spec["patience_checks"] * DISPLAY_EVERY
             early_stopping = ResumableEarlyStopping(
-                min_delta=1e-4, patience=EARLY_STOP_PATIENCE, monitor="loss_test", **es_kwargs
+                min_delta=1e-4, patience=spec_patience, monitor="loss_test", **es_kwargs
             )
             best_saver = BestModelSaver(
                 f"{spec['ckpt']}-BEST.pt", monitor="test loss", resume_best=resume_best_saver
@@ -1003,8 +1160,19 @@ if __name__ == "__main__":
                 json_path, weights_path, early_stopping, best_saver, save_every=CHECKPOINT_PERIOD
             )
             timing_probe = EarlyTimingProbe(spec["name"], probe_steps=20)
+            callbacks = [checker, early_stopping, best_saver, resume_ckpt, timing_probe]
+            if spec["divergence_threshold"] is not None:
+                callbacks.append(
+                    DivergenceGuard(
+                        spec["name"],
+                        DISPLAY_EVERY,
+                        metric_index=1,  # Rsquare_plume_tegother, see metrics=[...] in model.compile
+                        threshold=spec["divergence_threshold"],
+                        consecutive_checks=spec["divergence_checks"],
+                    )
+                )
 
-            print(f"Training {spec['name']}...")
+            print(f"Training {spec['name']}... (patience={spec_patience} steps / {spec['patience_checks']} checks)")
             start_time = time.time()
             losshistory, train_state = model.train(
                 iterations=remaining_iterations,
@@ -1012,7 +1180,7 @@ if __name__ == "__main__":
                 timestep_batch_size=TIMESTEP_BATCH_SIZE,
                 training_time_size=TRAINING_TIME_SIZE,
                 display_every=DISPLAY_EVERY,
-                callbacks=[checker, early_stopping, best_saver, resume_ckpt, timing_probe],
+                callbacks=callbacks,
             )
             elapsed = time.time() - start_time
         steps_run = max(train_state.step, 1)
