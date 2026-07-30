@@ -89,17 +89,21 @@ def mean_l2_relative_error_np(y_true, y_pred):
 
 def Rsquare_plume(y_true, y_pred):
     """Per-timestep R^2 outside the out-of-domain padding, averaged over timesteps and
-    samples. Ported unchanged from the original Fourier-MIONet_dP.py."""
+    samples. Ported unchanged from the original Fourier-MIONet_dP.py.
+
+    Mask is built elementwise per (row, col) from the final timestep, not just column 0
+    broadcast across all 200 columns -- the out-of-domain boundary varies by column, so
+    a column-0-only proxy leaked padded cells into the "valid" region (confirmed
+    materially larger for sg, negligible-but-real for dP -- fixed here for consistency)."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     r2 = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
+        mask = ~np.isclose(y_true[i, -1], OUT_OF_DOMAIN_SENTINEL)
         for j in range(24):
-            y_true_i = y_true[i, j, mask, :]
-            y_pred_i = y_pred[i, j, mask, :]
+            y_true_i = y_true[i, j][mask]
+            y_pred_i = y_pred[i, j][mask]
             sse = np.sum(np.square(y_true_i.flatten() - y_pred_i.flatten()))
             sst = np.sum(np.square(y_true_i.flatten() - np.mean(y_true_i.flatten())))
             r2 += 1 - sse / sst
@@ -108,16 +112,17 @@ def Rsquare_plume(y_true, y_pred):
 
 def Rsquare_plume_tegother(y_true, y_pred):
     """R^2 outside the out-of-domain padding, pooling all timesteps per sample before
-    averaging over samples. Ported unchanged from the original Fourier-MIONet_dP.py."""
+    averaging over samples. Ported unchanged from the original Fourier-MIONet_dP.py.
+
+    Mask is built elementwise per (row, col), same rationale as Rsquare_plume above."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     r2 = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], OUT_OF_DOMAIN_SENTINEL)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         sse = np.sum(np.square(y_true_i.flatten() - y_pred_i.flatten()))
         sst = np.sum(np.square(y_true_i.flatten() - np.mean(y_true_i.flatten())))
         r2 += 1 - sse / sst
@@ -125,16 +130,16 @@ def Rsquare_plume_tegother(y_true, y_pred):
 
 
 def MAE_plume(y_true, y_pred):
-    """MAE outside the out-of-domain padding, same masking as Rsquare_plume_tegother."""
+    """MAE outside the out-of-domain padding, same (elementwise, row-and-column) masking
+    as Rsquare_plume_tegother."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     mae = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], OUT_OF_DOMAIN_SENTINEL)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         mae += np.mean(np.abs(y_true_i.flatten() - y_pred_i.flatten()))
     return mae / size
 
@@ -557,12 +562,24 @@ class BestModelSaver(dde.callbacks.Callback):
 # ============================================================
 DATASET_CANDIDATES = [(400, 80), (200, 40)]
 
+# Fraction of the TRAINING pool (not test) held out as a validation split, so
+# checkpoint/EarlyStopping selection during training stops touching the test set --
+# see Fourier-UWNO-MIONet_dP_intermediate.py's identical mechanism for the full
+# rationale. No CLI in this script (it has none at all), so this is a plain module
+# constant like SEED, not an argparse flag.
+VAL_FRAC = 0.15
+
 
 def load_and_normalize_data():
-    """Load train/test data and fit all normalizers on train only. Side-effect-free
-    beyond disk reads, so this is safe to call from other scripts (e.g. an inference/
-    plotting script) without triggering training — only `if __name__ == "__main__"`
-    below actually trains anything."""
+    """Load train/val/test data and fit all normalizers on the TRAIN split only (not
+    val, not test). Side-effect-free beyond disk reads, so this is safe to call from
+    other scripts (e.g. an inference/plotting script) without triggering training --
+    only `if __name__ == "__main__"` below actually trains anything.
+
+    val is carved out of the training pool ONLY, deterministically from SEED, BEFORE
+    normalizer fitting -- so val statistics never leak into normalization either. test
+    is untouched here beyond being loaded/normalized with the train-fit normalizers,
+    same as before."""
     x_train = y_train = x_test = y_test = grid_x = None
     ntrain = ntest = None
     for cand_ntrain, cand_ntest in DATASET_CANDIDATES:
@@ -581,13 +598,30 @@ def load_and_normalize_data():
     x_train_field, x_train_MIO, xrt_train = x_train
     x_test_field, x_test_MIO, xrt_test = x_test
 
+    rng = np.random.RandomState(SEED)
+    perm = rng.permutation(ntrain)
+    n_val = int(round(ntrain * VAL_FRAC))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    print(
+        f"[val split] ntrain_pool={ntrain} -> train={len(train_idx)} val={len(val_idx)} "
+        f"(val_frac={VAL_FRAC}, split_seed={SEED}); test={ntest} untouched, used once "
+        f"at the end only."
+    )
+
+    x_val_field, x_val_MIO = x_train_field[val_idx], x_train_MIO[val_idx]
+    y_val = y_train[val_idx]
+    x_train_field, x_train_MIO = x_train_field[train_idx], x_train_MIO[train_idx]
+    y_train = y_train[train_idx]
+
     field_normalizer = UnitGaussianNormalizer(x_train_field)
     mio_normalizer = UnitGaussianNormalizer(x_train_MIO)
 
     x_train = (field_normalizer.encode(x_train_field), mio_normalizer.encode(x_train_MIO), xrt_train)
+    x_val = (field_normalizer.encode(x_val_field), mio_normalizer.encode(x_val_MIO), xrt_train)
     x_test = (field_normalizer.encode(x_test_field), mio_normalizer.encode(x_test_MIO), xrt_test)
 
-    # Train-only scaler for outputs
+    # Train-split-only scaler for outputs (not val, not test).
     scaler = StandardScaler().fit(y_train)
     mean = scaler.mean_.astype(np.float32)
     std = np.sqrt(scaler.var_.astype(np.float32))
@@ -601,12 +635,15 @@ def load_and_normalize_data():
     return {
         "x_train": x_train,
         "y_train": y_train,
+        "x_val": x_val,
+        "y_val": y_val,
         "x_test": x_test,
         "y_test": y_test,
         "x_test_field_raw": x_test_field,
         "grid_x": grid_x,
         "grid_dx": grid_dx,
-        "ntrain": ntrain,
+        "ntrain": len(train_idx),
+        "nval": len(val_idx),
         "ntest": ntest,
         "mean": mean,
         "std": std,
@@ -645,10 +682,15 @@ def make_loss_fnc(grid_dx, device):
         y_true = y_true.reshape(size, timesize, 96, 200)
         y_pred = y_pred.reshape(size, timesize, 96, 200)
 
-        z_axis = y_true[:, -1, :, 0]
-        sentinel = torch.as_tensor(OUT_OF_DOMAIN_SENTINEL, dtype=z_axis.dtype, device=z_axis.device)
-        mask = (~torch.isclose(z_axis, sentinel)).to(torch.float32)
-        mask = mask.reshape(size, 1, 96, 1)
+        # Elementwise per (row, col) from the final timestep -- NOT column 0 broadcast
+        # across all 200 columns. The out-of-domain boundary varies by column, so the
+        # column-0-only proxy leaked padded cells into "valid" rows (confirmed via
+        # dp_outlier_diagnosis.py / analyze_heterogeneity_gap.py: negligible for dP,
+        # materially inflated R2 for sg's equivalent mask).
+        last_t = y_true[:, -1, :, :]
+        sentinel = torch.as_tensor(OUT_OF_DOMAIN_SENTINEL, dtype=last_t.dtype, device=last_t.device)
+        mask = (~torch.isclose(last_t, sentinel)).to(torch.float32)
+        mask = mask.reshape(size, 1, 96, 200)
 
         y_true = y_true * mask
         y_pred = y_pred * mask
@@ -756,8 +798,14 @@ if __name__ == "__main__":
 
     data_bundle = load_and_normalize_data()
     x_train, y_train = data_bundle["x_train"], data_bundle["y_train"]
+    x_val, y_val = data_bundle["x_val"], data_bundle["y_val"]
     x_test, y_test = data_bundle["x_test"], data_bundle["y_test"]
     output_transform = make_output_transform(data_bundle["mean"], data_bundle["std"])
+
+    print(
+        f"[val split] train={data_bundle['ntrain']} val={data_bundle['nval']} "
+        f"test={data_bundle['ntest']} (test is held out, used once at the very end only)"
+    )
 
     results = {}
 
@@ -778,7 +826,13 @@ if __name__ == "__main__":
         # Preserved from the original dP script: QuadrupleCartesianProd (not Quadruple)
         # — every training step sees the full 24 timesteps for its sampled branch batch,
         # unlike sg's 8-of-24 timestep chunking.
-        data = dde.data.QuadrupleCartesianProd(x_train, y_train, x_test, y_test)
+        #
+        # NOTE: the second data pair below is x_val/y_val, NOT x_test/y_test -- see
+        # Fourier-UWNO-MIONet_dP_intermediate.py's identical comment for the full
+        # rationale (deepxde calls this slot "test" internally regardless of what's
+        # actually in it; the real test set is never passed to dde.data/Model here at
+        # all, only used once at the end via predict_in_chunks further down).
+        data = dde.data.QuadrupleCartesianProd(x_train, y_train, x_val, y_val)
 
         model = dde.Model(data, net)
         model.compile(
@@ -822,8 +876,11 @@ if __name__ == "__main__":
 
         print(f"{spec['name']} best step:", train_state.best_step)
         print(f"{spec['name']} best train loss:", train_state.best_loss_train)
-        print(f"{spec['name']} best test loss:", train_state.best_loss_test)
-        print(f"{spec['name']} best test metric:", train_state.best_metrics)
+        # deepxde labels this "loss_test"/"best_loss_test" internally, but the data in
+        # that slot is x_val/y_val (see the dde.data.QuadrupleCartesianProd call
+        # above) -- this is VAL loss/metric, not test.
+        print(f"{spec['name']} best VAL loss (deepxde calls this 'test loss'):", train_state.best_loss_test)
+        print(f"{spec['name']} best VAL metric (deepxde calls this 'test metric'):", train_state.best_metrics)
 
         best_path = f"{spec['ckpt']}-BEST.pt"
         if os.path.exists(best_path):
@@ -897,6 +954,12 @@ if __name__ == "__main__":
 
     print(f"\n{'=' * 100}")
     print(f"Per-checkpoint comparison: Fourier-MIONet vs U-WNO-MIONet (pressure buildup)")
+    print(
+        "NOTE: every *_test_* column below (and in the saved CSV) is the VAL split, "
+        "not the held-out test set -- column names unchanged to keep downstream "
+        "tooling compatible. Real test-set numbers are the 'Final summary' block "
+        "further down, computed once."
+    )
     print(f"{'=' * 100}")
 
     rows = []

@@ -113,16 +113,20 @@ def mean_l2_relative_error_np(y_true, y_pred):
 
 def Rsquare_plume_tegother(y_true, y_pred):
     """R^2 outside the out-of-domain padding, pooling all timesteps per sample before
-    averaging over samples. Ported unchanged from Fourier-UWNO-MIONet_dP.py."""
+    averaging over samples. Ported unchanged from Fourier-UWNO-MIONet_dP.py.
+
+    Mask is built elementwise per (row, col) from the final timestep, not just column 0
+    broadcast across all 200 columns -- the out-of-domain boundary varies by column, so
+    a column-0-only proxy leaked padded cells into the "valid" region (confirmed
+    materially larger for sg, negligible-but-real for dP -- fixed here for consistency)."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     r2 = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], OUT_OF_DOMAIN_SENTINEL)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         sse = np.sum(np.square(y_true_i.flatten() - y_pred_i.flatten()))
         sst = np.sum(np.square(y_true_i.flatten() - np.mean(y_true_i.flatten())))
         r2 += 1 - sse / sst
@@ -130,16 +134,16 @@ def Rsquare_plume_tegother(y_true, y_pred):
 
 
 def MAE_plume(y_true, y_pred):
-    """MAE outside the out-of-domain padding, same masking as Rsquare_plume_tegother."""
+    """MAE outside the out-of-domain padding, same (elementwise, row-and-column) masking
+    as Rsquare_plume_tegother."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     mae = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, OUT_OF_DOMAIN_SENTINEL)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], OUT_OF_DOMAIN_SENTINEL)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         mae += np.mean(np.abs(y_true_i.flatten() - y_pred_i.flatten()))
     return mae / size
 
@@ -477,13 +481,69 @@ DP_WNO_LAYERS = int(os.environ.get("DP_WNO_LAYERS", "1"))
 DP_WNO_WIDTH = int(os.environ.get("DP_WNO_WIDTH", "36"))
 _MERGE_WIDTH = 36  # fixed by branch/trunk output channels; not a free parameter
 
+# Wavelet basis / decomposition level -- previously hardcoded, never swept despite
+# being the most directly on-hypothesis untested knob for a wavelet-localization
+# architecture. CLI-overridable via --wavelet/--wavelet-level (see parse_args), not
+# env vars, for consistency with --wno-lr/--seed/etc.
+DP_WNO_WAVELET = "db6"
+DP_WNO_LEVEL = 4
+
+
+class DivergenceGuard(dde.callbacks.Callback):
+    """Fast-acting safety net for catastrophic collapse, independent of (and much
+    quicker than) the normal patience-until-improvement mechanisms below. Ported
+    unchanged from Fourier-UWNO-MIONet_sg.py, where it was built after two confirmed
+    U-WNO-MIONet divergence episodes (R2 collapsing to -24/-32) well within normal
+    EarlyStopping patience. Disabled entirely when `threshold` is None (see
+    --disable-wno-divergence-guard)."""
+
+    def __init__(self, label, display_every, metric_index=1, threshold=-10.0, consecutive_checks=2):
+        super().__init__()
+        self.label = label
+        self.display_every = display_every
+        self.metric_index = metric_index
+        self.threshold = threshold
+        self.consecutive_checks = consecutive_checks
+        self._consecutive_bad = 0
+        self._last_checked_step = None
+
+    def on_epoch_end(self):
+        if self.threshold is None:
+            return
+        ts = self.model.train_state
+        if ts.step == self._last_checked_step or ts.step % self.display_every != 0:
+            return
+        self._last_checked_step = ts.step
+        if ts.metrics_test is None or len(ts.metrics_test) <= self.metric_index:
+            return
+
+        value = float(ts.metrics_test[self.metric_index])
+        if value < self.threshold:
+            self._consecutive_bad += 1
+            print(
+                f"[divergence-guard] {self.label}: metric={value:.4f} < threshold={self.threshold} "
+                f"({self._consecutive_bad}/{self.consecutive_checks} consecutive bad checks) "
+                f"at step {ts.step}",
+                flush=True,
+            )
+            if self._consecutive_bad >= self.consecutive_checks:
+                print(
+                    f"[divergence-guard] {self.label}: stopping immediately -- "
+                    f"{self.consecutive_checks} consecutive real evaluations below "
+                    f"threshold={self.threshold}.",
+                    flush=True,
+                )
+                self.model.stop_training = True
+        else:
+            self._consecutive_bad = 0
+
 
 def _build_wavelet_decoder():
     dec = WaveletDecoder(
         width=DP_WNO_WIDTH,
-        level=4,
+        level=DP_WNO_LEVEL,
         size=[104, 208],
-        wavelet="db6",
+        wavelet=DP_WNO_WAVELET,
         layers=DP_WNO_LAYERS,
         width2=128,
         input_width=_MERGE_WIDTH,
@@ -662,10 +722,26 @@ NTRAIN, NTEST = 1000, 80
 # Historical smaller sizes, tried in order if a larger size hits a MemoryError.
 DATASET_FALLBACKS = [(400, 80), (200, 40)]
 
+# Fraction of the TRAINING pool (not test) held out as a validation split, so
+# checkpoint/EarlyStopping/DivergenceGuard selection during training stops touching the
+# test set at all -- see VAL_SPLIT_SEED below and --val-frac. Test is now only ever
+# used once, after training, for the final Rsquare_plume_tegother/MAE_plume report.
+VAL_FRAC = 0.15
+# Deterministic given --seed: read at call time via the module-level SEED (itself
+# CLI-overridable), NOT frozen as a default-argument value, so --seed actually changes
+# the split, not just weight init.
+VAL_SPLIT_SEED = None  # None -> falls back to SEED at call time, see below
+
 
 def load_and_normalize_data():
-    """Load train/test data and fit all normalizers on train only. Side-effect-free
-    beyond disk reads."""
+    """Load train/val/test data and fit all normalizers on the TRAIN split only (not
+    val, not test). Side-effect-free beyond disk reads.
+
+    The train/val split is carved out of the training pool ONLY -- test is never
+    touched here beyond being loaded and normalized with the train-fit normalizers
+    (unchanged from before). val is a genuine held-out subset of train, split off
+    BEFORE normalizer fitting, so val statistics never leak into normalization either.
+    """
     x_train = y_train = x_test = y_test = grid_x = None
     ntrain = ntest = None
     dataset_candidates = [(NTRAIN, NTEST)] + [
@@ -687,13 +763,33 @@ def load_and_normalize_data():
     x_train_field, x_train_MIO, xrt_train = x_train
     x_test_field, x_test_MIO, xrt_test = x_test
 
+    # Deterministic train/val split, carved out of the training pool BEFORE any
+    # normalizer sees the data -- val must never leak into train-fit statistics.
+    split_seed = VAL_SPLIT_SEED if VAL_SPLIT_SEED is not None else SEED
+    rng = np.random.RandomState(split_seed)
+    perm = rng.permutation(ntrain)
+    n_val = int(round(ntrain * VAL_FRAC))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    print(
+        f"[val split] ntrain_pool={ntrain} -> train={len(train_idx)} val={len(val_idx)} "
+        f"(val_frac={VAL_FRAC}, split_seed={split_seed}); test={ntest} untouched, "
+        f"used once at the end only."
+    )
+
+    x_val_field, x_val_MIO = x_train_field[val_idx], x_train_MIO[val_idx]
+    y_val = y_train[val_idx]
+    x_train_field, x_train_MIO = x_train_field[train_idx], x_train_MIO[train_idx]
+    y_train = y_train[train_idx]
+
     field_normalizer = UnitGaussianNormalizer(x_train_field)
     mio_normalizer = UnitGaussianNormalizer(x_train_MIO)
 
     x_train = (field_normalizer.encode(x_train_field), mio_normalizer.encode(x_train_MIO), xrt_train)
+    x_val = (field_normalizer.encode(x_val_field), mio_normalizer.encode(x_val_MIO), xrt_train)
     x_test = (field_normalizer.encode(x_test_field), mio_normalizer.encode(x_test_MIO), xrt_test)
 
-    # Train-only scaler for outputs
+    # Train-split-only scaler for outputs (not val, not test).
     scaler = StandardScaler().fit(y_train)
     mean = scaler.mean_.astype(np.float32)
     std = np.sqrt(scaler.var_.astype(np.float32))
@@ -706,12 +802,15 @@ def load_and_normalize_data():
     return {
         "x_train": x_train,
         "y_train": y_train,
+        "x_val": x_val,
+        "y_val": y_val,
         "x_test": x_test,
         "y_test": y_test,
         "x_test_field_raw": x_test_field,
         "grid_x": grid_x,
         "grid_dx": grid_dx,
-        "ntrain": ntrain,
+        "ntrain": len(train_idx),
+        "nval": len(val_idx),
         "ntest": ntest,
         "mean": mean,
         "std": std,
@@ -741,10 +840,15 @@ def make_loss_fnc(grid_dx, device):
         y_true = y_true.reshape(size, timesize, 96, 200)
         y_pred = y_pred.reshape(size, timesize, 96, 200)
 
-        z_axis = y_true[:, -1, :, 0]
-        sentinel = torch.as_tensor(OUT_OF_DOMAIN_SENTINEL, dtype=z_axis.dtype, device=z_axis.device)
-        mask = (~torch.isclose(z_axis, sentinel)).to(torch.float32)
-        mask = mask.reshape(size, 1, 96, 1)
+        # Elementwise per (row, col) from the final timestep -- NOT column 0 broadcast
+        # across all 200 columns. The out-of-domain boundary varies by column, so the
+        # column-0-only proxy leaked padded cells into "valid" rows (confirmed via
+        # dp_outlier_diagnosis.py / analyze_heterogeneity_gap.py: negligible for dP,
+        # materially inflated R2 for sg's equivalent mask).
+        last_t = y_true[:, -1, :, :]
+        sentinel = torch.as_tensor(OUT_OF_DOMAIN_SENTINEL, dtype=last_t.dtype, device=last_t.device)
+        mask = (~torch.isclose(last_t, sentinel)).to(torch.float32)
+        mask = mask.reshape(size, 1, 96, 200)
 
         y_true = y_true * mask
         y_pred = y_pred * mask
@@ -831,20 +935,42 @@ EARLY_STOP_PATIENCE_CHECKS = 10
 EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
 CHECKPOINT_PERIOD = 50
 
-MODEL_SPECS = [
-    {
-        "key": "fourier",
-        "name": "Fourier-MIONet",
-        "decoder_builder": _build_fourier_decoder,
-        "ckpt": "pre_train/dP_intermediate_fourier_model.ckpt",
-    },
-    {
-        "key": "wno",
-        "name": "U-WNO-MIONet",
-        "decoder_builder": _build_wavelet_decoder,
-        "ckpt": "pre_train/dP_intermediate_wno_model.ckpt",
-    },
-]
+# Per-model LR overrides + WNO-specific patience/divergence guard, ported from
+# Fourier-UWNO-MIONet_sg.py (both default to LR above, i.e. no behavior change unless
+# explicitly passed). dP had not previously had a confirmed divergence episode of its
+# own, but the wno_lr sweep this exists for is specifically testing whether dP's WNO
+# instability (like sg's) was partly a training-time artifact of the mask leak now
+# fixed in make_loss_fnc -- see the mask-fix commit and analyze_heterogeneity_gap.py.
+FOURIER_LR = LR
+WNO_LR = LR
+WNO_PATIENCE_CHECKS = 4
+WNO_DIVERGENCE_R2_THRESHOLD = -10.0
+WNO_DIVERGENCE_CHECKS = 2
+
+
+def _build_model_specs(state_dir, wno_patience_checks, wno_divergence_threshold, wno_divergence_checks):
+    return [
+        {
+            "key": "fourier",
+            "name": "Fourier-MIONet",
+            "decoder_builder": _build_fourier_decoder,
+            "ckpt": os.path.join(state_dir, "dP_intermediate_fourier_model.ckpt"),
+            "lr": FOURIER_LR,
+            "patience_checks": EARLY_STOP_PATIENCE_CHECKS,
+            "divergence_threshold": None,  # guard is WNO-only
+            "divergence_checks": None,
+        },
+        {
+            "key": "wno",
+            "name": "U-WNO-MIONet",
+            "decoder_builder": _build_wavelet_decoder,
+            "ckpt": os.path.join(state_dir, "dP_intermediate_wno_model.ckpt"),
+            "lr": WNO_LR,
+            "patience_checks": wno_patience_checks,
+            "divergence_threshold": wno_divergence_threshold,
+            "divergence_checks": wno_divergence_checks,
+        },
+    ]
 
 
 def parse_args():
@@ -866,7 +992,75 @@ def parse_args():
         "--state-dir",
         type=str,
         default="pre_train",
-        help="Directory for checkpoints and resume-state files.",
+        help="Directory for checkpoints and resume-state files. IMPORTANT: pass a "
+        "distinct --state-dir per config (e.g. per wno_lr/seed combination) -- "
+        "checkpoints (dP_intermediate_{fourier,wno}_model.ckpt*) now live under "
+        "--state-dir too (previously hardcoded to pre_train/ regardless of --state-dir, "
+        "which would silently collide across concurrently-running configs), so this "
+        "fully isolates each run's on-disk artifacts.",
+    )
+    p.add_argument("--seed", type=int, default=SEED, help="RNG seed (default 42).")
+    p.add_argument(
+        "--fourier-lr",
+        type=float,
+        default=FOURIER_LR,
+        help="Fourier-MIONet learning rate (default unchanged from the current 1e-3).",
+    )
+    p.add_argument(
+        "--wno-lr",
+        type=float,
+        default=WNO_LR,
+        help="U-WNO-MIONet learning rate (default unchanged from the current 1e-3 -- "
+        "override this alone to experiment with LR without touching Fourier-MIONet).",
+    )
+    p.add_argument(
+        "--wno-patience-checks",
+        type=int,
+        default=WNO_PATIENCE_CHECKS,
+        help="U-WNO-MIONet-only EarlyStopping tolerance in units of real evaluations "
+        "(same units as --early-stop-patience-checks, which stays Fourier-MIONet-only).",
+    )
+    p.add_argument(
+        "--wno-divergence-r2-threshold",
+        type=float,
+        default=WNO_DIVERGENCE_R2_THRESHOLD,
+        help="U-WNO-MIONet-only fast divergence guard: stop immediately if test R2 stays "
+        "below this threshold for --wno-divergence-checks consecutive real evaluations. "
+        "See --disable-wno-divergence-guard to turn this off.",
+    )
+    p.add_argument(
+        "--wno-divergence-checks",
+        type=int,
+        default=WNO_DIVERGENCE_CHECKS,
+        help="Number of consecutive real evaluations below --wno-divergence-r2-threshold "
+        "required to trigger the fast divergence guard. Default 2.",
+    )
+    p.add_argument(
+        "--disable-wno-divergence-guard",
+        action="store_true",
+        help="Turn off the fast divergence guard entirely (normal EarlyStopping patience "
+        "-- --wno-patience-checks -- still applies).",
+    )
+    p.add_argument(
+        "--wavelet",
+        type=str,
+        default=DP_WNO_WAVELET,
+        help="U-WNO-MIONet wavelet basis (default db6). Previously hardcoded.",
+    )
+    p.add_argument(
+        "--wavelet-level",
+        type=int,
+        default=DP_WNO_LEVEL,
+        help="U-WNO-MIONet wavelet decomposition level (default 4). Previously hardcoded.",
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=VAL_FRAC,
+        help="Fraction of the TRAINING pool (not test) held out as a validation split "
+        "for checkpoint/EarlyStopping/DivergenceGuard selection (default 0.15). "
+        "Deterministic given --seed. Test is never used for selection, only for the "
+        "final one-time report.",
     )
     return p.parse_args()
 
@@ -879,15 +1073,34 @@ if __name__ == "__main__":
     ITERATIONS = args.iterations
     DISPLAY_EVERY = args.display_every
     EARLY_STOP_PATIENCE_CHECKS = args.early_stop_patience_checks
+    SEED = args.seed
+    FOURIER_LR = args.fourier_lr
+    WNO_LR = args.wno_lr
+    WNO_PATIENCE_CHECKS = args.wno_patience_checks
+    WNO_DIVERGENCE_R2_THRESHOLD = None if args.disable_wno_divergence_guard else args.wno_divergence_r2_threshold
+    WNO_DIVERGENCE_CHECKS = args.wno_divergence_checks
+    DP_WNO_WAVELET = args.wavelet
+    DP_WNO_LEVEL = args.wavelet_level
+    VAL_FRAC = args.val_frac
     DECAY_STEP = int(0.4 * ITERATIONS)
     EARLY_STOP_PATIENCE = EARLY_STOP_PATIENCE_CHECKS * DISPLAY_EVERY
+    WNO_PATIENCE = WNO_PATIENCE_CHECKS * DISPLAY_EVERY
+    MODEL_SPECS = _build_model_specs(
+        args.state_dir, WNO_PATIENCE_CHECKS, WNO_DIVERGENCE_R2_THRESHOLD, WNO_DIVERGENCE_CHECKS
+    )
 
     print(
         f"[config] ntrain={NTRAIN} ntest={NTEST} batch_size={BATCH_SIZE} "
         f"timestep_batch_size={TIMESTEP_BATCH_SIZE} iterations={ITERATIONS} "
-        f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} "
-        f"early_stop_patience={EARLY_STOP_PATIENCE} ({EARLY_STOP_PATIENCE_CHECKS} real checks) "
-        f"DP_WNO_LAYERS={DP_WNO_LAYERS} DP_WNO_WIDTH={DP_WNO_WIDTH}"
+        f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} seed={SEED} "
+        f"fourier_lr={FOURIER_LR} early_stop_patience={EARLY_STOP_PATIENCE} "
+        f"({EARLY_STOP_PATIENCE_CHECKS} real checks) "
+        f"wno_lr={WNO_LR} wno_patience={WNO_PATIENCE} ({WNO_PATIENCE_CHECKS} real checks) "
+        f"wno_divergence_guard="
+        f"{'disabled' if WNO_DIVERGENCE_R2_THRESHOLD is None else f'R2<{WNO_DIVERGENCE_R2_THRESHOLD} x{WNO_DIVERGENCE_CHECKS}'} "
+        f"DP_WNO_LAYERS={DP_WNO_LAYERS} DP_WNO_WIDTH={DP_WNO_WIDTH} "
+        f"wavelet={DP_WNO_WAVELET} wavelet_level={DP_WNO_LEVEL} val_frac={VAL_FRAC} "
+        f"state_dir={args.state_dir}"
     )
 
     os.makedirs(args.state_dir, exist_ok=True)
@@ -895,8 +1108,14 @@ if __name__ == "__main__":
 
     data_bundle = load_and_normalize_data()
     x_train, y_train = data_bundle["x_train"], data_bundle["y_train"]
+    x_val, y_val = data_bundle["x_val"], data_bundle["y_val"]
     x_test, y_test = data_bundle["x_test"], data_bundle["y_test"]
     output_transform = make_output_transform(data_bundle["mean"], data_bundle["std"])
+
+    print(
+        f"[val split] train={data_bundle['ntrain']} val={data_bundle['nval']} "
+        f"test={data_bundle['ntest']} (test is held out, used once at the very end only)"
+    )
 
     results = {}
 
@@ -913,14 +1132,25 @@ if __name__ == "__main__":
         # Preserved from Fourier-UWNO-MIONet_dP.py: QuadrupleCartesianProd (not
         # Quadruple) -- every training step sees the full 24 timesteps for its sampled
         # branch batch, unlike sg's 8-of-24 timestep chunking.
-        data = dde.data.QuadrupleCartesianProd(x_train, y_train, x_test, y_test)
+        #
+        # NOTE: the second data pair below is x_val/y_val, NOT x_test/y_test.
+        # deepxde's Data/Model API calls this slot "test" internally (hence
+        # ModelCheckpoint(monitor="test loss"), EarlyStopping(monitor="loss_test"), and
+        # DivergenceGuard reading ts.metrics_test below all still say "test") -- but the
+        # data actually feeding those checks is now the held-out validation split. The
+        # real test set (x_test/y_test) is never passed to dde.data/Model at all; it's
+        # only used once, after training, via predict_in_chunks + Rsquare_plume_tegother
+        # /MAE_plume further down. This is intentional: checkpoint/early-stopping/
+        # divergence-guard selection must not see the test set.
+        data = dde.data.QuadrupleCartesianProd(x_train, y_train, x_val, y_val)
 
         model = dde.Model(data, net)
+        print(f"[config] {spec['name']}: lr={spec['lr']}")
         model.compile(
             "rmsprop",
             loss=make_loss_fnc(data_bundle["grid_dx"], device),
             loss_weights=[1, 0.5],
-            lr=LR,
+            lr=spec["lr"],
             decay=("step", DECAY_STEP, DECAY_GAMMA),
             metrics=["mean l2 relative error", Rsquare_plume_tegother, MAE_plume],
         )
@@ -971,10 +1201,24 @@ if __name__ == "__main__":
             checker = dde.callbacks.ModelCheckpoint(
                 spec["ckpt"], save_better_only=True, period=CHECKPOINT_PERIOD, monitor="test loss"
             )
-            early_stopping = ResumableEarlyStopping(min_delta=1e-4, patience=EARLY_STOP_PATIENCE, **es_kwargs)
+            # Per-spec patience: Fourier-MIONet keeps EARLY_STOP_PATIENCE_CHECKS (10,
+            # unchanged); U-WNO-MIONet uses its own, tighter spec["patience_checks"].
+            spec_patience = spec["patience_checks"] * DISPLAY_EVERY
+            early_stopping = ResumableEarlyStopping(min_delta=1e-4, patience=spec_patience, **es_kwargs)
             best_saver = BestModelSaver(f"{spec['ckpt']}-BEST.pt")
             resume_ckpt = ResumeCheckpoint(json_path, weights_path, early_stopping, save_every=CHECKPOINT_PERIOD)
             timing_probe = EarlyTimingProbe(spec["name"], probe_steps=20)
+            callbacks = [checker, early_stopping, best_saver, resume_ckpt, timing_probe]
+            if spec["divergence_threshold"] is not None:
+                callbacks.append(
+                    DivergenceGuard(
+                        spec["name"],
+                        DISPLAY_EVERY,
+                        metric_index=1,
+                        threshold=spec["divergence_threshold"],
+                        consecutive_checks=spec["divergence_checks"],
+                    )
+                )
 
             print(f"Training {spec['name']}...")
             start_time = time.time()
@@ -985,15 +1229,20 @@ if __name__ == "__main__":
                 training_time_size=TRAINING_TIME_SIZE,
                 display_every=DISPLAY_EVERY,
                 init_test=True,
-                callbacks=[checker, early_stopping, best_saver, resume_ckpt, timing_probe],
+                callbacks=callbacks,
             )
             elapsed = time.time() - start_time
         steps_run = max(train_state.step, 1)
 
         print(f"{spec['name']} best step:", train_state.best_step)
         print(f"{spec['name']} best train loss:", train_state.best_loss_train)
-        print(f"{spec['name']} best test loss:", train_state.best_loss_test)
-        print(f"{spec['name']} best test metric:", train_state.best_metrics)
+        # deepxde labels this "loss_test"/"best_loss_test" internally, but the data in
+        # that slot is x_val/y_val (see the dde.data.QuadrupleCartesianProd call
+        # above) -- this is VAL loss/metric, not test. Printed with that label spelled
+        # out explicitly here to avoid exactly the kind of silent mislabeling this
+        # session's masking-bug hunt was about.
+        print(f"{spec['name']} best VAL loss (deepxde calls this 'test loss'):", train_state.best_loss_test)
+        print(f"{spec['name']} best VAL metric (deepxde calls this 'test metric'):", train_state.best_metrics)
 
         best_path = f"{spec['ckpt']}-BEST.pt"
         if os.path.exists(best_path):
@@ -1064,6 +1313,12 @@ if __name__ == "__main__":
 
     print(f"\n{'=' * 100}")
     print(f"Per-checkpoint comparison: Fourier-MIONet vs U-WNO-MIONet (pressure buildup, intermediate scale)")
+    print(
+        "NOTE: every *_test_* column below (and in the saved CSV) is the VAL split, "
+        "not the held-out test set -- column names are unchanged from before the val "
+        "split existed to keep aggregate_wno_lr_sweep.py's schema compatible. The real "
+        "test-set numbers are the 'Final summary' block further down, computed once."
+    )
     print(f"{'=' * 100}")
 
     rows = []
@@ -1097,12 +1352,18 @@ if __name__ == "__main__":
             f"| U-WNO-MIONet R2={w_r2} MAE={w_mae} | delta R2={d_r2}"
         )
 
-    with open("comparison_log_dp_intermediate.csv", "w", newline="") as f:
+    # Routed through --state-dir, NOT a hardcoded repo-root filename -- a shared
+    # relative path here previously meant every concurrently-running --state-dir
+    # config (e.g. a wno_lr/seed sweep) silently overwrote the same file, since
+    # open(..., "w") truncates on every run regardless of state_dir isolation
+    # everywhere else. Confirmed to have actually happened in the first wno_lr sweep.
+    comparison_csv_path = os.path.join(args.state_dir, "comparison_log_dp_intermediate.csv")
+    with open(comparison_csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
 
-    print("\nSaved per-checkpoint comparison to comparison_log_dp_intermediate.csv")
+    print(f"\nSaved per-checkpoint comparison to {comparison_csv_path}")
 
     # ============================================================
     # Final summary

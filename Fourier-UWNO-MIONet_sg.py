@@ -86,16 +86,22 @@ def mean_l2_relative_error_np(y_true, y_pred):
 def Rsquare_plume_tegother(y_true, y_pred):
     """R^2 restricted to the CO2 plume region (saturation ~0 at final timestep is masked
     out). Ported from baselines/MIONet_vanilla_SG.py so both models are scored the same
-    way the original paper code scored Fourier-MIONet."""
+    way the original paper code scored Fourier-MIONet.
+
+    Mask is built elementwise per (row, col) from the final timestep, not just column 0
+    broadcast across all 200 columns -- the out-of-domain boundary varies by column, so
+    a column-0-only proxy leaked padded/zero cells into the "valid" region (confirmed:
+    29.7% average / 69.2% max of cells in mask-called-valid rows were still genuinely
+    zero at the final timestep, materially inflating R2 -- 0.240 -> -0.028 for
+    Fourier-MIONet once corrected)."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     r2 = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, 0.0)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], 0.0)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         sse = np.sum(np.square(y_true_i.flatten() - y_pred_i.flatten()))
         sst = np.sum(np.square(y_true_i.flatten() - np.mean(y_true_i.flatten())))
         r2 += 1 - sse / sst
@@ -103,16 +109,16 @@ def Rsquare_plume_tegother(y_true, y_pred):
 
 
 def MAE_plume(y_true, y_pred):
-    """MAE restricted to the CO2 plume region, same masking as Rsquare_plume_tegother."""
+    """MAE restricted to the CO2 plume region, same (elementwise, row-and-column) masking
+    as Rsquare_plume_tegother."""
     size = y_true.shape[0]
     y_true = np.asarray(y_true).reshape(size, 24, 96, 200)
     y_pred = np.asarray(y_pred).reshape(size, 24, 96, 200)
     mae = 0.0
     for i in range(size):
-        z_axis = y_true[i, -1, :, 0]
-        mask = ~np.isclose(z_axis, 0.0)
-        y_true_i = y_true[i][:, mask, :]
-        y_pred_i = y_pred[i][:, mask, :]
+        mask = ~np.isclose(y_true[i, -1], 0.0)
+        y_true_i = y_true[i][:, mask]
+        y_pred_i = y_pred[i][:, mask]
         mae += np.mean(np.abs(y_true_i.flatten() - y_pred_i.flatten()))
     return mae / size
 
@@ -401,7 +407,7 @@ class WrappedTrunk(nn.Module):
 
 
 def _build_wavelet_decoder():
-    dec = WaveletDecoder(width=36, level=4, size=[104, 208], wavelet="db6", layers=4, width2=128)
+    dec = WaveletDecoder(width=36, level=WNO_LEVEL, size=[104, 208], wavelet=WNO_WAVELET, layers=4, width2=128)
     dec.set_unet(
         nn.ModuleList(
             [
@@ -714,12 +720,24 @@ NTRAIN, NTEST = 2000, 222
 # Historical smaller sizes, tried in order if a larger size hits a MemoryError.
 DATASET_FALLBACKS = [(400, 80), (200, 40)]
 
+# Fraction of the TRAINING pool (not test) held out as a validation split, so
+# checkpoint/EarlyStopping/DivergenceGuard selection during training stops touching
+# the test set at all. CLI-overridable via --val-frac (see parse_args). Deterministic
+# given --seed. Test is only ever used once, after training, for the final
+# Rsquare_plume_tegother/MAE_plume report.
+VAL_FRAC = 0.15
+
 
 def load_and_normalize_data():
-    """Load train/test data and fit all normalizers on train only. Side-effect-free
-    beyond disk reads, so this is safe to call from other scripts (e.g. an inference/
-    plotting script) without triggering training — only `if __name__ == "__main__"`
-    below actually trains anything."""
+    """Load train/val/test data and fit all normalizers on the TRAIN split only (not
+    val, not test). Side-effect-free beyond disk reads, so this is safe to call from
+    other scripts (e.g. an inference/plotting script) without triggering training --
+    only `if __name__ == "__main__"` below actually trains anything.
+
+    val is carved out of the training pool ONLY, deterministically from SEED, BEFORE
+    normalizer fitting -- so val statistics never leak into normalization either. test
+    is untouched here beyond being loaded/normalized with the train-fit normalizers,
+    same as before."""
     x_train = y_train = x_test = y_test = grid_x = None
     ntrain = ntest = None
     dataset_candidates = [(NTRAIN, NTEST)] + [
@@ -745,13 +763,30 @@ def load_and_normalize_data():
     x_train_field, x_train_MIO, xrt_train = x_train
     x_test_field, x_test_MIO, xrt_test = x_test
 
+    rng = np.random.RandomState(SEED)
+    perm = rng.permutation(ntrain)
+    n_val = int(round(ntrain * VAL_FRAC))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    print(
+        f"[val split] ntrain_pool={ntrain} -> train={len(train_idx)} val={len(val_idx)} "
+        f"(val_frac={VAL_FRAC}, split_seed={SEED}); test={ntest} untouched, used once "
+        f"at the end only."
+    )
+
+    x_val_field, x_val_MIO = x_train_field[val_idx], x_train_MIO[val_idx]
+    y_val = y_train[val_idx]
+    x_train_field, x_train_MIO = x_train_field[train_idx], x_train_MIO[train_idx]
+    y_train = y_train[train_idx]
+
     field_normalizer = UnitGaussianNormalizer(x_train_field)
     mio_normalizer = UnitGaussianNormalizer(x_train_MIO)
 
     x_train = (field_normalizer.encode(x_train_field), mio_normalizer.encode(x_train_MIO), xrt_train)
+    x_val = (field_normalizer.encode(x_val_field), mio_normalizer.encode(x_val_MIO), xrt_train)
     x_test = (field_normalizer.encode(x_test_field), mio_normalizer.encode(x_test_MIO), xrt_test)
 
-    # Train-only scaler for outputs
+    # Train-split-only scaler for outputs (not val, not test).
     scaler = StandardScaler().fit(y_train)
     mean = scaler.mean_.astype(np.float32)
     std = np.sqrt(scaler.var_.astype(np.float32))
@@ -760,11 +795,14 @@ def load_and_normalize_data():
     return {
         "x_train": x_train,
         "y_train": y_train,
+        "x_val": x_val,
+        "y_val": y_val,
         "x_test": x_test,
         "y_test": y_test,
         "x_test_field_raw": x_test_field,
         "grid_x": grid_x,
-        "ntrain": ntrain,
+        "ntrain": len(train_idx),
+        "nval": len(val_idx),
         "ntest": ntest,
         "mean": mean,
         "std": std,
@@ -923,6 +961,12 @@ CHECKPOINT_PERIOD = 20
 FOURIER_LR = LR
 WNO_LR = LR
 
+# Wavelet basis / decomposition level -- previously hardcoded, never swept despite
+# being the most directly on-hypothesis untested knob for a wavelet-localization
+# architecture. CLI-overridable via --wavelet/--wavelet-level (see parse_args).
+WNO_WAVELET = "db6"
+WNO_LEVEL = 4
+
 
 def _build_model_specs(state_dir, wno_patience_checks, wno_divergence_threshold, wno_divergence_checks):
     return [
@@ -1022,6 +1066,28 @@ def parse_args():
         help="Turn off the fast divergence guard entirely (normal EarlyStopping patience "
         "-- --wno-patience-checks -- still applies).",
     )
+    p.add_argument("--seed", type=int, default=SEED, help="RNG seed (default 42).")
+    p.add_argument(
+        "--wavelet",
+        type=str,
+        default=WNO_WAVELET,
+        help="U-WNO-MIONet wavelet basis (default db6). Previously hardcoded.",
+    )
+    p.add_argument(
+        "--wavelet-level",
+        type=int,
+        default=WNO_LEVEL,
+        help="U-WNO-MIONet wavelet decomposition level (default 4). Previously hardcoded.",
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=VAL_FRAC,
+        help="Fraction of the TRAINING pool (not test) held out as a validation split "
+        "for checkpoint/EarlyStopping/DivergenceGuard selection (default 0.15). "
+        "Deterministic given --seed. Test is never used for selection, only for the "
+        "final one-time report.",
+    )
     return p.parse_args()
 
 
@@ -1036,11 +1102,15 @@ if __name__ == "__main__":
     ITERATIONS = args.iterations
     DISPLAY_EVERY = args.display_every
     EARLY_STOP_PATIENCE_CHECKS = args.early_stop_patience_checks
+    SEED = args.seed
     FOURIER_LR = args.fourier_lr
     WNO_LR = args.wno_lr
     WNO_PATIENCE_CHECKS = args.wno_patience_checks
     WNO_DIVERGENCE_R2_THRESHOLD = None if args.disable_wno_divergence_guard else args.wno_divergence_r2_threshold
     WNO_DIVERGENCE_CHECKS = args.wno_divergence_checks
+    WNO_WAVELET = args.wavelet
+    WNO_LEVEL = args.wavelet_level
+    VAL_FRAC = args.val_frac
     # Both re-derived from the just-parsed args, not left at their module-level-default
     # values -- these are exactly the two values that silently went stale in previous
     # scale-ups if only ITERATIONS/DISPLAY_EVERY were overridden without recomputing them.
@@ -1054,13 +1124,14 @@ if __name__ == "__main__":
     print(
         f"[config] ntrain={NTRAIN} ntest={NTEST} batch_size={BATCH_SIZE} "
         f"timestep_batch_size={TIMESTEP_BATCH_SIZE} iterations={ITERATIONS} "
-        f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} "
+        f"display_every={DISPLAY_EVERY} decay_step={DECAY_STEP} seed={SEED} "
         f"fourier_lr={FOURIER_LR} fourier_patience={EARLY_STOP_PATIENCE} "
         f"({EARLY_STOP_PATIENCE_CHECKS} real checks) "
         f"wno_lr={WNO_LR} wno_patience={WNO_PATIENCE} ({WNO_PATIENCE_CHECKS} real checks) "
         f"wno_divergence_guard="
         f"{'disabled' if WNO_DIVERGENCE_R2_THRESHOLD is None else f'R2<{WNO_DIVERGENCE_R2_THRESHOLD} x{WNO_DIVERGENCE_CHECKS}'} "
-        f"checkpoint_period={CHECKPOINT_PERIOD} state_dir={args.state_dir}"
+        f"checkpoint_period={CHECKPOINT_PERIOD} wavelet={WNO_WAVELET} wavelet_level={WNO_LEVEL} "
+        f"val_frac={VAL_FRAC} state_dir={args.state_dir}"
     )
 
     os.makedirs(args.state_dir, exist_ok=True)
@@ -1068,8 +1139,14 @@ if __name__ == "__main__":
 
     data_bundle = load_and_normalize_data()
     x_train, y_train = data_bundle["x_train"], data_bundle["y_train"]
+    x_val, y_val = data_bundle["x_val"], data_bundle["y_val"]
     x_test, y_test = data_bundle["x_test"], data_bundle["y_test"]
     output_transform = make_output_transform(data_bundle["mean"], data_bundle["std"])
+
+    print(
+        f"[val split] train={data_bundle['ntrain']} val={data_bundle['nval']} "
+        f"test={data_bundle['ntest']} (test is held out, used once at the very end only)"
+    )
 
     results = {}
 
@@ -1084,7 +1161,12 @@ if __name__ == "__main__":
         net = build_net(spec["decoder_builder"], output_transform)
 
         reset_seed(SEED)
-        data = dde.data.Quadruple(x_train, y_train, x_test, y_test)
+        # NOTE: the second data pair below is x_val/y_val, NOT x_test/y_test -- see
+        # Fourier-UWNO-MIONet_dP_intermediate.py's identical comment for the full
+        # rationale (deepxde calls this slot "test" internally regardless of what's
+        # actually in it; the real test set is never passed to dde.data/Model here at
+        # all, only used once at the end via predict_in_chunks further down).
+        data = dde.data.Quadruple(x_train, y_train, x_val, y_val)
 
         model = dde.Model(data, net)
         print(f"[config] {spec['name']}: lr={spec['lr']}")
@@ -1187,8 +1269,11 @@ if __name__ == "__main__":
 
         print(f"{spec['name']} best step:", train_state.best_step)
         print(f"{spec['name']} best train loss:", train_state.best_loss_train)
-        print(f"{spec['name']} best test loss:", train_state.best_loss_test)
-        print(f"{spec['name']} best test metric:", train_state.best_metrics)
+        # deepxde labels this "loss_test"/"best_loss_test" internally, but the data in
+        # that slot is x_val/y_val (see the dde.data.Quadruple call above) -- this is
+        # VAL loss/metric, not test.
+        print(f"{spec['name']} best VAL loss (deepxde calls this 'test loss'):", train_state.best_loss_test)
+        print(f"{spec['name']} best VAL metric (deepxde calls this 'test metric'):", train_state.best_metrics)
 
         best_path = f"{spec['ckpt']}-BEST.pt"
         if os.path.exists(best_path):
@@ -1266,6 +1351,12 @@ if __name__ == "__main__":
 
     print(f"\n{'=' * 100}")
     print(f"Per-checkpoint comparison: Fourier-MIONet vs U-WNO-MIONet")
+    print(
+        "NOTE: every *_test_* column below (and in the saved CSV) is the VAL split, "
+        "not the held-out test set -- column names unchanged to keep downstream "
+        "tooling compatible. Real test-set numbers are the 'Final summary' block "
+        "further down, computed once."
+    )
     print(f"{'=' * 100}")
 
     rows = []
@@ -1299,12 +1390,18 @@ if __name__ == "__main__":
             f"| U-WNO-MIONet R2={w_r2} MAE={w_mae} | delta R2={d_r2}"
         )
 
-    with open("comparison_log.csv", "w", newline="") as f:
+    # Routed through --state-dir, NOT a hardcoded repo-root filename -- a shared
+    # relative path here previously meant every concurrently-running --state-dir
+    # config (e.g. a wno_lr/seed sweep) silently overwrote the same file, since
+    # open(..., "w") truncates on every run regardless of state_dir isolation
+    # everywhere else. Confirmed to have actually happened in the first wno_lr sweep.
+    comparison_csv_path = os.path.join(args.state_dir, "comparison_log.csv")
+    with open(comparison_csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(rows)
 
-    print("\nSaved per-checkpoint comparison to comparison_log.csv")
+    print(f"\nSaved per-checkpoint comparison to {comparison_csv_path}")
 
     # ============================================================
     # Final summary

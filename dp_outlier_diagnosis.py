@@ -183,7 +183,10 @@ def main():
         help="Which training script to import model-building/data-loading code from "
         "(its module-level NTRAIN/NTEST control the data scale used here).",
     )
-    parser.add_argument("--out-json", default="dp_outlier_diagnosis_results.json")
+    # No default on purpose: a shared default filename is exactly what caused the
+    # sweep's comparison_log_*.csv collision (same root cause -- a hardcoded/shared
+    # output path across repeated invocations silently overwrites prior runs' results).
+    parser.add_argument("--out-json", required=True)
     args = parser.parse_args()
 
     module = _load_module(args.module_path, "dp_intermediate_module")

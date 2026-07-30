@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-07-30T18:56:55.592Z",
+  "projectRoot": "/Users/ericliu/U-WNO-MIONet/fourier-mionet-gcs",
+  "structure": {
+    "hasPackageJson": false,
+    "hasTsConfig": false,
+    "hasClaudeConfig": false,
+    "hasClaudeFlow": true
+  },
+  "scannedAt": 1785437815592
+}
